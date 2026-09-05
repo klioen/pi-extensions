@@ -1,11 +1,11 @@
 {
-	"name": "pi-extensions",
+	"name": "pi-subagents",
 	"version": "0.1.0",
-	"description": "Custom pi coding agent packages: web-access (web_search, web_fetch) and subagents (spawn_agent and friends).",
+	"description": "Background subagent tools (spawn_agent, wait_agent, send_input, list_agents, close_agent) for the pi coding agent.",
 	"type": "module",
 	"keywords": ["pi-package"],
 	"pi": {
-		"extensions": ["./packages/web-access/extensions", "./packages/subagents/extensions"]
+		"extensions": ["./extensions"]
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-agent-core": "*",

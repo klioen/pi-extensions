@@ -1,64 +1,65 @@
 # pi-extensions
 
-Custom extensions for the [pi coding agent](https://github.com/earendil-works/pi-mono), packaged as a pi package.
+Custom packages for the [pi coding agent](https://github.com/earendil-works/pi-mono). Two independent packages live here; install either one or both.
 
-## Extensions
+## Packages
 
-### web_search
+### pi-web-access — `packages/web-access`
 
-Searches the public web and returns per-result summaries. Ported from mpa-agent's `app/runtime/tools/web_search.py` (veadk `ve_request` signing; API details in the extension source).
+- **web_search** — searches the public web and returns per-result summaries. Ported from mpa-agent's `app/runtime/tools/web_search.py` (veadk `ve_request` signing; API details in the extension source).
+  Credentials: `TOOL_WEB_SEARCH_ACCESS_KEY`/`SECRET_KEY` → `VOLCENGINE_ACCESS_KEY`/`SECRET_KEY` → IAM credential JSON (`VOLCENGINE_CREDENTIAL_FILE` file or `IAM_CREDENTIAL` env; fields `access_key_id`, `secret_access_key`, optional `session_token`).
+- **web_fetch** — fetches a URL and returns markdown (default), plain text, html, or an image attachment. Ported from mpa-agent's `web_fetch.py` (modeled after opencode's webfetch). SSRF protection (private/loopback/metadata addresses blocked, every redirect hop re-validated), 5MB cap, manual redirects (max 5), Cloudflare challenge retry, charset detection. HTML→markdown conversion is dependency-free.
 
-Credentials are resolved in this order:
+If the community pi-web-access extension is also installed, disable it to avoid `web_search` name collisions.
 
-1. `TOOL_WEB_SEARCH_ACCESS_KEY` + `TOOL_WEB_SEARCH_SECRET_KEY`
-2. `VOLCENGINE_ACCESS_KEY` + `VOLCENGINE_SECRET_KEY`
-3. IAM credential JSON: file at `VOLCENGINE_CREDENTIAL_FILE`, or raw JSON in `IAM_CREDENTIAL`
-   (fields: `access_key_id`, `secret_access_key`, optional `session_token`)
+### pi-subagents — `packages/subagents`
+
+Background subagents modeled after codex's `multi_agent_v1` tool surface. Each subagent is an in-process pi `AgentSession` (in-memory history) with its own context window, a restricted tool allowlist (default `read` + `bash`), and the parent's current model.
+
+- **spawn_agent** — start a background agent with a self-contained task; returns immediately
+- **wait_agent** — wait for all (or listed) agents and return their final messages
+- **send_input** — follow up with an agent; reuses its accumulated context
+- **list_agents** — status overview
+- **close_agent** — abort and release an agent (or `all`)
+
+Up to 8 agents run in parallel; cleaned up on session shutdown.
 
 ## Install
 
-Local (development):
+Single packages (local paths):
+
+```
+pi install /path/to/pi-extensions/packages/web-access
+pi install /path/to/pi-extensions/packages/subagents
+```
+
+Or both at once via the umbrella package:
 
 ```
 pi install /path/to/pi-extensions
 ```
 
-Or link it directly in `~/.pi/agent/settings.json`:
+Remote (after pushing to GitHub), e.g. for subagents only:
+
+```
+pi install git:github.com/klioen/pi-extensions
+```
+
+Note: git installs always fetch the whole repo; to expose only one package remotely, publish it to npm separately or filter resources in settings:
 
 ```json
 {
-	"packages": ["/Users/bytedance/Code/pi-extensions"]
+	"packages": [
+		{
+			"source": "git:github.com/klioen/pi-extensions",
+			"extensions": ["packages/web-access/extensions/*.ts"]
+		}
+	]
 }
 ```
 
-Remote (after pushing to GitHub):
-
-```
-pi install git:github.com/<user>/pi-extensions
-```
-
-Extensions in `extensions/` are auto-discovered via the `pi` manifest in `package.json`. Edit a file and run `/reload` in pi to pick up changes (local path installs only).
-
 ## Development
 
-No build step: pi loads TypeScript directly. Runtime deps must be zero or listed in `dependencies`; pi core packages (`@earendil-works/pi-coding-agent`, `typebox`, ...) are peer-provided and must not be bundled.
+No build step: pi loads TypeScript directly. Runtime deps must be zero or listed in `dependencies`; pi core packages (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-ai`, `typebox`) are peer-provided and must not be bundled.
 
-Tools are named `web_search` and `web_fetch`. If the pi-web-access extension is also installed, disable it or its tools to avoid name collisions with `web_search`.
-
-### web_fetch
-
-Fetches a URL and returns markdown (default), plain text, html, or an image attachment. Ported from mpa-agent's `app/runtime/tools/web_fetch.py` (modeled after opencode's webfetch). Includes SSRF protection (private/loopback/metadata addresses blocked, every redirect hop re-validated), 5MB size cap, manual redirect following (max 5), Cloudflare challenge retry, and charset detection. HTML to markdown conversion is dependency-free and covers common structural tags.
-
-### subagents
-
-Spawn and manage background subagents, modeled after codex's `multi_agent_v1` tool surface. Each subagent is an in-process pi `AgentSession` (in-memory history) with its own context window, a restricted tool allowlist (default `read` + `bash`), and the parent's current model.
-
-Tools:
-
-- `spawn_agent` — start a background agent with a self-contained task; returns immediately
-- `wait_agent` — wait for all (or listed) agents and return their final messages
-- `send_input` — follow up with an agent; reuses its accumulated context
-- `list_agents` — status overview
-- `close_agent` — abort and release an agent (or `all`)
-
-Up to 8 agents run in parallel. Agents are cleaned up automatically on session shutdown.
+For local path installs, edit a file and run `/reload` in pi to pick up changes.
