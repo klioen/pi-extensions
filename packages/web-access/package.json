@@ -1,0 +1,14 @@
+{
+	"name": "pi-web-access",
+	"version": "0.1.0",
+	"description": "Web search and URL fetch tools for the pi coding agent.",
+	"type": "module",
+	"keywords": ["pi-package"],
+	"pi": {
+		"extensions": ["./extensions"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	}
+}
