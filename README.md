@@ -48,3 +48,17 @@ Tools are named `web_search` and `web_fetch`. If the pi-web-access extension is 
 ### web_fetch
 
 Fetches a URL and returns markdown (default), plain text, html, or an image attachment. Ported from mpa-agent's `app/runtime/tools/web_fetch.py` (modeled after opencode's webfetch). Includes SSRF protection (private/loopback/metadata addresses blocked, every redirect hop re-validated), 5MB size cap, manual redirect following (max 5), Cloudflare challenge retry, and charset detection. HTML to markdown conversion is dependency-free and covers common structural tags.
+
+### subagents
+
+Spawn and manage background subagents, modeled after codex's `multi_agent_v1` tool surface. Each subagent is an in-process pi `AgentSession` (in-memory history) with its own context window, a restricted tool allowlist (default `read` + `bash`), and the parent's current model.
+
+Tools:
+
+- `spawn_agent` — start a background agent with a self-contained task; returns immediately
+- `wait_agent` — wait for all (or listed) agents and return their final messages
+- `send_input` — follow up with an agent; reuses its accumulated context
+- `list_agents` — status overview
+- `close_agent` — abort and release an agent (or `all`)
+
+Up to 8 agents run in parallel. Agents are cleaned up automatically on session shutdown.
