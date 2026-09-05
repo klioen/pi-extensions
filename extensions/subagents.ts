@@ -74,7 +74,8 @@ async function runAgent(entry: AgentEntry, firstMessage: string, model: unknown,
 			return;
 		}
 		entry.status = "running";
-		let pending: AgentMessage[] = [];
+		// The subscription stays alive for the agent's lifetime so later turns
+		// triggered by send_input keep updating finalMessages.
 		entry.subscribe = session.subscribe((event) => {
 			if (event.type === "agent_end") {
 				entry.finalMessages = event.messages;
@@ -86,9 +87,6 @@ async function runAgent(entry: AgentEntry, firstMessage: string, model: unknown,
 	} catch (err) {
 		entry.status = "error";
 		entry.error = err instanceof Error ? err.message : String(err);
-	} finally {
-		entry.subscribe?.();
-		entry.subscribe = undefined;
 	}
 }
 
