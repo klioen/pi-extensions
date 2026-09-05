@@ -4,7 +4,7 @@ Custom extensions for the [pi coding agent](https://github.com/earendil-works/pi
 
 ## Extensions
 
-### web_search
+### web_search + web_fetch
 
 Searches the public web and returns per-result summaries. Ported from mpa-agent's `app/runtime/tools/web_search.py` (veadk `ve_request` signing; API details in the extension source).
 
@@ -44,3 +44,7 @@ Extensions in `extensions/` are auto-discovered via the `pi` manifest in `packag
 No build step: pi loads TypeScript directly. Runtime deps must be zero or listed in `dependencies`; pi core packages (`@earendil-works/pi-coding-agent`, `typebox`, ...) are peer-provided and must not be bundled.
 
 Tool name is `web_search` (not `web_search`) to avoid colliding with the pi-web-access extension.
+
+### web_fetch
+
+Fetches a URL and returns markdown (default), plain text, html, or an image attachment. Ported from mpa-agent's `app/runtime/tools/web_fetch.py` (modeled after opencode's webfetch). Includes SSRF protection (private/loopback/metadata addresses blocked, every redirect hop re-validated), 5MB size cap, manual redirect following (max 5), Cloudflare challenge retry, and charset detection. HTML to markdown conversion is dependency-free and covers common structural tags.
