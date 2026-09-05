@@ -1,10 +1,8 @@
 /**
- * volc_web_search: search the public web through Volcano Engine WebSearch.
+ * web_search: search the public web and return per-result summaries.
  *
  * Ported from mpa-agent's app/runtime/tools/web_search.py (which uses
- * veadk's ve_request): POST to mercury.volcengineapi.com with
- * Action=WebSearch, Version=2025-01-01, service volc_torchlight_api,
- * region cn-beijing, HMAC-SHA256 (Volcano SigV4) signing.
+ * veadk's ve_request).
  *
  * Credential resolution order (mirrors mpa-agent):
  *   1. TOOL_WEB_SEARCH_ACCESS_KEY / TOOL_WEB_SEARCH_SECRET_KEY
@@ -91,7 +89,7 @@ function loadCredentials(): Credentials {
 	}
 
 	throw new Error(
-		"No Volcano Engine credentials. Set TOOL_WEB_SEARCH_ACCESS_KEY/SECRET_KEY, " +
+		"Web search credentials missing. Set TOOL_WEB_SEARCH_ACCESS_KEY/SECRET_KEY, " +
 			"VOLCENGINE_ACCESS_KEY/SECRET_KEY, VOLCENGINE_CREDENTIAL_FILE, or IAM_CREDENTIAL.",
 	);
 }
@@ -183,7 +181,7 @@ async function veWebSearch(
 			: signal,
 	});
 	if (!response.ok) {
-		throw new Error(`Volcano Engine WebSearch HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
+		throw new Error(`Web search HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
 	}
 	const payload = (await response.json()) as {
 		ResponseMetadata?: { Error?: { Code?: string; CodeN?: number | string; Message?: string } };
@@ -192,7 +190,7 @@ async function veWebSearch(
 	const error = payload.ResponseMetadata?.Error;
 	if (error) {
 		const code = String(error.Code ?? error.CodeN ?? "").trim();
-		throw new Error(`Volcano Engine WebSearch failed: ${code ? `${code}: ` : ""}${String(error.Message ?? "")}`);
+		throw new Error(`Web search failed: ${code ? `${code}: ` : ""}${String(error.Message ?? "")}`);
 	}
 	return payload.Result?.WebResults ?? [];
 }
@@ -214,13 +212,11 @@ function formatResults(results: WebResult[]): string {
 
 export default function (pi: ExtensionAPI) {
 	pi.registerTool({
-		name: "volc_web_search",
-		label: "Volcano Web Search",
-		description:
-			"Search the public web through Volcano Engine WebSearch and return per-result summaries. " +
-			"Credentials come from TOOL_WEB_SEARCH_ACCESS_KEY/SECRET_KEY, VOLCENGINE_ACCESS_KEY/SECRET_KEY, " +
-			"VOLCENGINE_CREDENTIAL_FILE, or IAM_CREDENTIAL.",
-		promptSnippet: "Use for web search when Volcano Engine (Chinese web) coverage is preferred.",
+		name: "web_search",
+		label: "Web Search",
+		description: "Search the public web and return per-result summaries. " +
+			"Use for web research questions; supports Chinese web coverage well.",
+		promptSnippet: "Use for web search and web research questions.",
 		parameters: Type.Object({
 			query: Type.String({ description: "Required search query." }),
 			count: Type.Optional(
@@ -238,7 +234,7 @@ export default function (pi: ExtensionAPI) {
 				const results = await veWebSearch(query, count, credentials, signal);
 				return {
 					content: [{ type: "text", text: formatResults(results) }],
-					details: { provider: "volcengine", query, count, resultCount: results.length },
+					details: { query, count, resultCount: results.length },
 				};
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
