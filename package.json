@@ -1,0 +1,14 @@
+{
+	"name": "pi-extensions",
+	"version": "0.1.0",
+	"description": "Custom pi coding agent extensions. First tool: volc_web_search (Volcano Engine WebSearch).",
+	"type": "module",
+	"keywords": ["pi-package"],
+	"pi": {
+		"extensions": ["./extensions"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	}
+}
