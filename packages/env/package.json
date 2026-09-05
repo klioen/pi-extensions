@@ -1,0 +1,13 @@
+{
+	"name": "pi-env",
+	"version": "0.1.0",
+	"description": "Load pi-specific .env files (~/.pi/agent/.env and .pi/.env) into process.env without polluting the global shell environment.",
+	"type": "module",
+	"keywords": ["pi-package"],
+	"pi": {
+		"extensions": ["./extensions"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	}
+}
