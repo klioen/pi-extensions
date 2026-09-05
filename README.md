@@ -4,7 +4,7 @@ Custom extensions for the [pi coding agent](https://github.com/earendil-works/pi
 
 ## Extensions
 
-### web_search + web_fetch
+### web_search
 
 Searches the public web and returns per-result summaries. Ported from mpa-agent's `app/runtime/tools/web_search.py` (veadk `ve_request` signing; API details in the extension source).
 
@@ -43,7 +43,7 @@ Extensions in `extensions/` are auto-discovered via the `pi` manifest in `packag
 
 No build step: pi loads TypeScript directly. Runtime deps must be zero or listed in `dependencies`; pi core packages (`@earendil-works/pi-coding-agent`, `typebox`, ...) are peer-provided and must not be bundled.
 
-Tool name is `web_search` (not `web_search`) to avoid colliding with the pi-web-access extension.
+Tools are named `web_search` and `web_fetch`. If the pi-web-access extension is also installed, disable it or its tools to avoid name collisions with `web_search`.
 
 ### web_fetch
 
