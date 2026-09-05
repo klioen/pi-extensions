@@ -4,9 +4,9 @@ Custom extensions for the [pi coding agent](https://github.com/earendil-works/pi
 
 ## Extensions
 
-### volc_web_search
+### web_search
 
-Searches the public web through Volcano Engine WebSearch (`mercury.volcengineapi.com`, Action `WebSearch`) and returns per-result summaries. Ported from mpa-agent's `app/runtime/tools/web_search.py` (veadk `ve_request` signing).
+Searches the public web and returns per-result summaries. Ported from mpa-agent's `app/runtime/tools/web_search.py` (veadk `ve_request` signing; API details in the extension source).
 
 Credentials are resolved in this order:
 
@@ -43,4 +43,4 @@ Extensions in `extensions/` are auto-discovered via the `pi` manifest in `packag
 
 No build step: pi loads TypeScript directly. Runtime deps must be zero or listed in `dependencies`; pi core packages (`@earendil-works/pi-coding-agent`, `typebox`, ...) are peer-provided and must not be bundled.
 
-Tool name is `volc_web_search` (not `web_search`) to avoid colliding with the pi-web-access extension.
+Tool name is `web_search` (not `web_search`) to avoid colliding with the pi-web-access extension.
