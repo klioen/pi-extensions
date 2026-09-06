@@ -1,0 +1,14 @@
+{
+	"name": "pi-failover",
+	"version": "0.1.0",
+	"description": "Automatic multi-API-key failover for OpenAI-compatible providers (default ark): retry with the next key on 429/quota limits, no proxy in between.",
+	"type": "module",
+	"keywords": ["pi-package"],
+	"pi": {
+		"extensions": ["./extensions"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-ai": "*"
+	}
+}

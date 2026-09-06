@@ -1,11 +1,18 @@
 {
 	"name": "pi-extensions",
 	"version": "0.1.0",
-	"description": "Custom pi coding agent packages: env (.env loader), web-access (web_search, web_fetch), subagents (spawn_agent and friends), and memory (OpenViking memory).",
+	"description": "Custom pi coding agent packages: env (.env loader), web-access, subagents, and failover (multi-API-key failover).",
 	"type": "module",
-	"keywords": ["pi-package"],
+	"keywords": [
+		"pi-package"
+	],
 	"pi": {
-		"extensions": ["./packages/env/extensions", "./packages/web-access/extensions", "./packages/subagents/extensions", "./packages/memory/extensions"]
+		"extensions": [
+			"./packages/env/extensions",
+			"./packages/web-access/extensions",
+			"./packages/subagents/extensions",
+			"./packages/failover/extensions"
+		]
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-agent-core": "*",
