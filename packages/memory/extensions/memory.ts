@@ -18,9 +18,12 @@
  *     child process (worker/worker.js) polls the queue, claims a lease, calls
  *     the LLM via plain fetch (independent of the pi runtime), writes
  *     stage1_outputs + rollout_summaries/ + raw_memories.md.
- *   Phase 2 (every N phase-1 jobs, or /memory consolidate): the extension
- *     enqueues a 'phase2' job; the worker consolidates raw memories + existing
- *     artifacts into fresh MEMORY.md and memory_summary.md.
+ *   Phase 2 (Codex-aligned): after each phase-1 success the worker advances a
+ *     global 'memory_consolidate_global' singleton job watermark; the worker
+ *     claims it only when the 6h success cooldown / 1h retry backoff allow,
+ *     pre-checks for new inputs, and runs a full consolidation AGENT (a forked
+ *     `pi --print` child with read/grep/edit/write tools) that rewrites
+ *     MEMORY.md and memory_summary.md in place.
  *   Recall (every before_agent_start): memory_summary.md is injected into the
  *     system prompt with a decision boundary, like Codex's read_path.md.
  */
@@ -43,7 +46,6 @@ const MEMORY_DIR = (process.env.PI_MEMORY_DIR || path.join(os.homedir(), ".pi", 
 const DB_PATH = path.join(MEMORY_DIR, "memory.db");
 const RECALL_ENABLED = process.env.PI_MEMORY_RECALL !== "0";
 const AUTO_ENQUEUE = process.env.PI_MEMORY_AUTO !== "0";
-const CONSOLIDATE_EVERY = Math.max(1, Number(process.env.PI_MEMORY_CONSOLIDATE_EVERY) || 3);
 const SUMMARY_TOKEN_LIMIT = Math.max(500, Number(process.env.PI_MEMORY_SUMMARY_TOKENS) || 4000);
 const ROLLOUT_CHAR_LIMIT = Math.max(4000, Number(process.env.PI_MEMORY_ROLLOUT_CHARS) || 20000);
 const EXTRACT_MODEL = process.env.PI_MEMORY_EXTRACT_MODEL || ""; // optional override, like codex extract_model
@@ -78,6 +80,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_error TEXT,
     created_at INTEGER NOT NULL,
     finished_at INTEGER,
+    started_at INTEGER,
+    input_watermark INTEGER,
+    last_success_watermark INTEGER,
     PRIMARY KEY (kind, job_key)
 );
 CREATE TABLE IF NOT EXISTS stage1_outputs (
@@ -161,15 +166,21 @@ function collectMessages(sm: { getEntries: () => unknown[]; getLeafId: () => str
 let worker: ChildProcess | null = null;
 let workerConfig: Record<string, unknown> | null = null;
 
-function resolveExtractModel(ctxModel: unknown): { baseUrl: string; model: string; apiKey: string; maxTokens?: number } {
+function resolveExtractModel(ctxModel: unknown): { baseUrl: string; model: string; phase2Model: string; apiKey: string; maxTokens?: number } {
 	const m = ctxModel as { baseUrl?: string; id?: string; provider?: string } | undefined;
-	const baseUrl = process.env.PI_MEMORY_BASE_URL || m?.baseUrl || "http://localhost:11434/v1";
-	const model = EXTRACT_MODEL || process.env.PI_MEMORY_EXTRACT_MODEL || m?.id || "qwen3.8:latest";
-	// apiKey: prefer the env pool (ARK_*), else provider-specific env, else placeholder
+	// baseUrl: explicit override, else the current model's baseUrl. When that is
+	// unavailable fall back to the ark OpenAI-compatible endpoint (the default pi
+	// provider) rather than ollama.
+	const baseUrl = process.env.PI_MEMORY_BASE_URL || m?.baseUrl || "https://ark.cn-beijing.volces.com/api/coding/v3";
+	// extract model: explicit override, else the current model id.
+	const model = EXTRACT_MODEL || process.env.PI_MEMORY_EXTRACT_MODEL || m?.id || "";
+	// phase-2 consolidation AGENT model: explicit, else same as extract model.
+	// `pi --print --model <provider>/<id>` expects the provider-prefixed form.
+	const phase2Model = process.env.PI_MEMORY_PHASE2_MODEL || (m?.provider ? `${m.provider}/${model}` : model);
 	const keys = (process.env.ARK_API_KEYS || "").split(",").map((k) => k.trim()).filter(Boolean);
 	const apiKey = keys[0] || process.env.ARK_API_KEY || (m?.provider ? process.env[`${m.provider.toUpperCase()}_API_KEY`] : "") || "placeholder";
 	const maxTokens = Number(process.env.PI_MEMORY_EXTRACT_MAX_TOKENS) || 2048;
-	return { baseUrl, model, apiKey, maxTokens };
+	return { baseUrl, model, phase2Model, apiKey, maxTokens };
 }
 
 function startWorker(ctxModel: unknown): void {
@@ -303,6 +314,9 @@ export default function (pi: ExtensionAPI) {
 				const phase1Count = state.phase1Count + 1;
 
 				// Enqueue a phase-1 job; worker claims and executes asynchronously.
+				// Phase-2 consolidation is triggered by the worker itself after a
+				// phase-1 success (watermark advance), gated by cooldown/backoff —
+				// exactly like Codex's global phase-2 singleton job.
 				enqueueJob("phase1", threadId, {
 					transcript,
 					rolloutPath: String(sm.getSessionFile?.() ?? ""),
@@ -310,11 +324,6 @@ export default function (pi: ExtensionAPI) {
 					threadId,
 				});
 				upsertState(DB_STATE_KEY, { lastExtractedId: msgs[msgs.length - 1].entryId, phase1Count });
-
-				// Enqueue phase-2 consolidation every N phase-1 jobs.
-				if (phase1Count % CONSOLIDATE_EVERY === 0) {
-					enqueueJob("phase2", "consolidation", { reason: `phase1 count ${phase1Count}` });
-				}
 
 				if (!worker) startWorker(ctx.model);
 			} catch {
@@ -332,7 +341,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (sub === "consolidate") {
-				enqueueJob("phase2", "consolidation", { reason: "manual" });
+				enqueueJob("memory_consolidate_global", "consolidation", { reason: "manual", force: true });
 				ctx.ui.notify("pi-memory: phase2 consolidation job enqueued (worker will pick it up).", "info");
 				return;
 			}
