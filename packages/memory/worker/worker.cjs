@@ -23,7 +23,7 @@ const { SCHEMA, phase1Prompt, completeLLM, parseJsonObj } = require(path.join(__
 
 const WORKER_ID = `w-${process.pid}`;
 const POLL_MS_DEFAULT = 3000;
-const LEASE_MS = 5 * 60 * 1000;         // 5min lease (phase1 is a single short LLM call; 1h was too slow to self-heal)
+const LEASE_MS = 60 * 60 * 1000;        // 1h lease (codex JOB_LEASE_SECONDS=3600); idempotent retry makes it safe
 const RETRY_DELAY_MS = 60 * 60 * 1000;  // 1h retry backoff (codex JOB_RETRY_DELAY_SECONDS)
 const PHASE2_SUCCESS_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h cooldown (codex)
 const PHASE2_AGENT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -61,11 +61,25 @@ function claimPhase1Jobs() {
          AND (lease_until IS NULL OR lease_until <= ?)
        ORDER BY created_at ASC LIMIT ?`,
 	).all(now, now, CONCURRENCY);
+	// Codex idempotency: skip jobs whose input_watermark is already covered by
+	// stage1_outputs.source_updated_at (SkippedUpToDate). A retried or duplicate
+	// phase-1 job then marks completed without re-running the LLM.
+	const upToDate = rows.filter((row) => {
+		if (!row.input_watermark) return false;
+		const output = db.prepare(`SELECT source_updated_at FROM stage1_outputs WHERE thread_id = ?`).get(row.job_key);
+		return output && Number(output.source_updated_at) >= Number(row.input_watermark);
+	});
+	for (const row of upToDate) {
+		// job was never claimed, so no ownership token — update status directly
+		db.prepare(`UPDATE jobs SET status='completed', finished_at=? WHERE kind='phase1' AND job_key=?`).run(Date.now(), row.job_key);
+		log(`phase1 ${row.job_key}: up-to-date (watermark ${row.input_watermark}), skipping`);
+	}
+	const eligible = rows.filter((row) => !upToDate.includes(row));
 	const stmt = db.prepare(
 		`UPDATE jobs SET status='leased', worker_id=?, ownership_token=?, lease_until=? WHERE kind='phase1' AND job_key=? AND status IN ('pending','failed')`,
 	);
 	const claimed = [];
-	for (const row of rows) {
+	for (const row of eligible) {
 		const token = `${WORKER_ID}-${row.job_key}-${Date.now()}`;
 		if (stmt.run(WORKER_ID, token, now + LEASE_MS, row.job_key).changes > 0) {
 			row.ownership_token = token;
@@ -211,12 +225,13 @@ async function runPhase1(row) {
 	const raw = await completeLLM(cfg.llm, prompt);
 	const parsed = parseJsonObj(raw);
 	if (!parsed || (!parsed.raw_memory && !parsed.rollout_summary)) throw new Error("phase1 LLM output unparseable or empty");
+	const sourceUpdatedAt = row.input_watermark || Date.now(); // codex: source_updated_at = the input watermark
 	db.prepare(
 		`INSERT INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, rollout_slug, cwd)
      VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(thread_id) DO UPDATE SET source_updated_at=excluded.source_updated_at, raw_memory=excluded.raw_memory,
        rollout_summary=excluded.rollout_summary, rollout_slug=excluded.rollout_slug, cwd=excluded.cwd`,
-	).run(payload.threadId, Date.now(), parsed.raw_memory, parsed.rollout_summary, parsed.rollout_slug ?? null, payload.rolloutCwd);
+	).run(payload.threadId, sourceUpdatedAt, parsed.raw_memory, parsed.rollout_summary, parsed.rollout_slug ?? null, payload.rolloutCwd);
 	const file = writePhase1Artifacts(parsed, payload.rolloutCwd, payload.threadId);
 	log(`phase1 done: ${file}`);
 	// phase-1 success advances the phase-2 watermark (codex: enqueue_global_consolidation)
