@@ -264,8 +264,9 @@ async function runPhase2AsAgent(row) {
 	const env = {
 		...process.env,
 		PI_MEMORY_DIR: cfg.memDir,
-		PI_MEMORY_AUTO: "0",   // child pi must not enqueue new jobs (no loops)
-		PI_MEMORY_RECALL: "0", // no recall injection in the child
+		PI_MEMORY_AUTO: "0",        // child must not enqueue new jobs (no loops)
+		PI_MEMORY_RECALL: "0",      // no recall injection in the child
+		PI_MEMORY_AGENT_CHILD: "1", // child must not fork its own worker (no chain)
 	};
 	const args = ["--print"];
 	if (modelSpec) args.push("--model", modelSpec);

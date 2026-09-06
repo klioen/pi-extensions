@@ -283,6 +283,9 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		// When running as a phase-2 consolidation agent (forked by the worker),
+		// never fork another worker — the child only edits the memory workspace.
+		if (process.env.PI_MEMORY_AGENT_CHILD === "1") return;
 		startWorker(ctx.model);
 	});
 
