@@ -220,18 +220,8 @@ function ensureLayout() {
 	if (!fs.existsSync(rf)) fs.writeFileSync(rf, "# Raw Memories\n\n");
 }
 
-function writePhase1Artifacts(output, cwd, threadId) {
-	ensureLayout();
-	const ts = new Date().toISOString().replace(/[:.]/g, "-");
-	const slug = (output.rollout_slug?.trim() || "").replace(/[^\w-]+/g, "-").replace(/^-+|-+$/g, "") || "rollout";
-	const file = path.join(cfg.memDir, "rollout_summaries", `${ts}-${slug}.md`);
-	fs.writeFileSync(file, [`# ${slug}`, "", `- thread_id: ${threadId}`, `- updated_at: ${new Date().toISOString()}`, `- cwd: ${cwd}`, "", output.rollout_summary?.trim() ?? "", ""].join("\n"));
-	const raw = fs.readFileSync(path.join(cfg.memDir, "raw_memories.md"), "utf8");
-	const append = ["", `## Thread \`${threadId}\` (${ts})`, "", `updated_at: ${new Date().toISOString()}`, `cwd: ${cwd}`, `rollout_summary_file: ${path.relative(cfg.memDir, file)}`, "", output.raw_memory?.trim() ?? "", ""].join("\n");
-	fs.writeFileSync(path.join(cfg.memDir, "raw_memories.md"), raw.replace(/\s*$/, "\n") + append);
-	return path.relative(cfg.memDir, file);
-}
-
+// Codex phase-1 writes only to SQLite (stage1_outputs); rollout summary files
+// are materialized later by phase-2 (sync_rollout_summaries_from_memories).
 async function runPhase1(row) {
 	const payload = JSON.parse(row.payload);
 	const prompt = phase1Prompt(payload.transcript, payload.rolloutPath, payload.rolloutCwd);
@@ -245,8 +235,7 @@ async function runPhase1(row) {
      ON CONFLICT(thread_id) DO UPDATE SET source_updated_at=excluded.source_updated_at, raw_memory=excluded.raw_memory,
        rollout_summary=excluded.rollout_summary, rollout_slug=excluded.rollout_slug, cwd=excluded.cwd`,
 	).run(payload.threadId, sourceUpdatedAt, parsed.raw_memory, parsed.rollout_summary, parsed.rollout_slug ?? null, payload.rolloutCwd);
-	const file = writePhase1Artifacts(parsed, payload.rolloutCwd, payload.threadId);
-	log(`phase1 done: ${file}`);
+	log(`phase1 done: ${payload.threadId} -> stage1_outputs (watermark ${sourceUpdatedAt})`);
 	// phase-1 success advances the phase-2 watermark (codex: enqueue_global_consolidation)
 	enqueuePhase2();
 }
@@ -326,10 +315,76 @@ function phase2AgentPrompt(memDir) {
 	].join("\n");
 }
 
+const MAX_RAW_FOR_CONSOLIDATION = Math.max(1, Number(process.env.PI_MEMORY_MAX_RAW_CONSOLIDATION) || 256); // codex DEFAULT=256
+
+// Codex sync_rollout_summaries_from_memories + rebuild_raw_memories_file:
+// materialize the selected stage1_outputs (latest first, capped) into
+// rollout_summaries/<stem>.md (one per thread; prune files no longer in the
+// selection) and rebuild raw_memories.md as the merged input for phase 2.
+function rolloutStem(m) {
+	const ts = new Date(Number(m.source_updated_at) || Date.now()).toISOString().replace(/[:.]/g, "-").slice(0, 23);
+	const slug = (m.rollout_slug || "rollout").replace(/[^\w-]+/g, "-").replace(/^-+|-+$/g, "");
+	return `${ts}-${slug}-${String(m.thread_id).slice(0, 8)}`;
+}
+
+function materializePhase2Inputs() {
+	ensureLayout();
+	// codex get_phase2_input_selection: newest first, cap at MAX
+	const selected = db.prepare(
+		`SELECT * FROM stage1_outputs ORDER BY source_updated_at DESC, thread_id DESC LIMIT ?`,
+	).all(MAX_RAW_FOR_CONSOLIDATION);
+
+	// prune rollout summaries not in the selection (codex prune_rollout_summaries)
+	const keep = new Set(selected.map((m) => rolloutStem(m)));
+	const dir = path.join(cfg.memDir, "rollout_summaries");
+	if (fs.existsSync(dir)) {
+		for (const f of fs.readdirSync(dir)) {
+			if (!f.endsWith(".md")) continue;
+			const stem = f.replace(/\.md$/, "");
+			if (!keep.has(stem)) fs.rmSync(path.join(dir, f));
+		}
+	}
+
+	// write one summary file per thread
+	for (const m of selected) {
+		const stem = rolloutStem(m);
+		fs.writeFileSync(
+			path.join(dir, `${stem}.md`),
+			[
+				`# ${m.rollout_slug || "rollout"}`,
+				``,
+				`- thread_id: ${m.thread_id}`,
+				`- updated_at: ${new Date(Number(m.source_updated_at)).toISOString()}`,
+				`- cwd: ${m.cwd || ""}`,
+				``,
+				m.rollout_summary || "",
+				``,
+			].join("\n"),
+		);
+	}
+
+	// rebuild raw_memories.md (merged, stable ascending thread-id order like codex)
+	let body = "# Raw Memories\n\n";
+	if (selected.length === 0) body += "No raw memories yet.\n";
+	else {
+		body += "Merged stage-1 raw memories (stable ascending thread-id order):\n\n";
+		const asc = [...selected].sort((a, b) => (a.thread_id < b.thread_id ? -1 : a.thread_id > b.thread_id ? 1 : 0));
+		for (const m of asc) {
+			body += `## Thread \`${m.thread_id}\` (${new Date(Number(m.source_updated_at)).toISOString()})\n\n`;
+			body += `updated_at: ${new Date(Number(m.source_updated_at)).toISOString()}\n`;
+			if (m.cwd) body += `cwd: ${m.cwd}\n`;
+			body += `rollout_summary_file: rollout_summaries/${rolloutStem(m)}.md\n\n`;
+			body += (m.raw_memory || "").trim() + "\n\n";
+		}
+	}
+	fs.writeFileSync(path.join(cfg.memDir, "raw_memories.md"), body);
+	log(`phase2 inputs materialized: ${selected.length} stage1_outputs -> rollout_summaries/ + raw_memories.md`);
+}
+
 async function runPhase2AsAgent(row) {
-	// Codex-aligned pre-check: the git workspace is the source of truth for
-	// whether consolidation has work. When the workspace is clean (phase-1
-	// inputs already consolidated and baseline committed), skip the LLM.
+	// Codex: first materialize phase-1 DB outputs into the workspace, then the
+	// git diff decides whether consolidation has work.
+	materializePhase2Inputs();
 	if (!workspaceHasChanges()) {
 		log("phase2: no workspace changes since last consolidation; skipping LLM");
 		markPhase2Completed(row);
@@ -459,6 +514,48 @@ function startLoop() {
 	};
 	void schedule();
 }
+
+let shuttingDown = false;
+
+function releaseOwnLeases() {
+	if (!db) return;
+	try {
+		const now = Date.now();
+		const res = db.prepare(
+			`UPDATE jobs SET status='pending', worker_id=NULL, ownership_token=NULL, lease_until=NULL, started_at=NULL
+			 WHERE status='leased' AND worker_id = ? AND lease_until > ?`,
+		).run(WORKER_ID, now);
+		if (res.changes > 0) log(`released ${res.changes} stranded leased job(s) owned by ${WORKER_ID}`);
+	} catch {
+		/* best-effort on exit */
+	}
+}
+
+function drainAndExit() {
+	if (shuttingDown) return;
+	shuttingDown = true;
+	log("shutdown requested; draining pending jobs before exit");
+	(async () => {
+		for (let i = 0; i < 40; i++) {
+			await pollOnce();
+			const pending = db.prepare(
+				`SELECT COUNT(*) AS n FROM jobs WHERE status IN ('pending','failed') AND (retry_until IS NULL OR retry_until <= ?)`,
+			).get(Date.now()).n;
+			if (pending === 0) {
+				log("queue drained; exiting");
+				process.exit(0);
+				return;
+			}
+			await new Promise((r) => setTimeout(r, 1000));
+		}
+		log("grace period elapsed with pending jobs; exiting");
+		process.exit(0);
+	})();
+}
+
+process.on("exit", () => { releaseOwnLeases(); });
+process.on("SIGTERM", () => { releaseOwnLeases(); process.exit(0); });
+process.on("SIGINT", () => { releaseOwnLeases(); process.exit(0); });
 
 process.on("message", (msg) => {
 	if (!msg) return;
