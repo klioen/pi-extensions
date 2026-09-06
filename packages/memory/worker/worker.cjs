@@ -28,6 +28,7 @@ const RETRY_DELAY_MS = 60 * 60 * 1000;  // 1h retry backoff (codex JOB_RETRY_DEL
 const PHASE2_SUCCESS_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h cooldown (codex)
 const PHASE2_AGENT_TIMEOUT_MS = 10 * 60 * 1000;
 const CONCURRENCY = 4;
+const MIN_ROLLOUT_IDLE_MS = (Number(process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS) || 6) * 3600 * 1000; // codex default 6h
 
 let cfg = null;
 let db = null;
@@ -54,13 +55,25 @@ function kvSet(key, value) {
 
 function claimPhase1Jobs() {
 	const now = Date.now();
-	const rows = db.prepare(
+	// Codex min_rollout_idle_hours: a rollout is only extracted once the
+	// conversation has been idle for MIN_ROLLOUT_IDLE_HOURS. The job carries
+	// input_watermark = timestamp of the last message; we only claim it once
+	// now - watermark >= idle window. Jobs stay pending until then — matching
+	// codex's "next startup extracts idle history" behavior (stability over
+	// realtime).
+	const idleCutoff = now - MIN_ROLLOUT_IDLE_MS;
+	const allRows = db.prepare(
 		`SELECT * FROM jobs
        WHERE kind = 'phase1' AND status IN ('pending','failed')
          AND (status = 'pending' OR (retry_until IS NOT NULL AND retry_until <= ?))
          AND (lease_until IS NULL OR lease_until <= ?)
        ORDER BY created_at ASC LIMIT ?`,
-	).all(now, now, CONCURRENCY);
+	).all(now, now, CONCURRENCY * 4);
+	// Drop not-yet-idle jobs (keep them pending for a later poll).
+	const rows = allRows.filter((row) => {
+		if (!row.input_watermark) return true; // no ts → no idle gate (legacy)
+		return row.input_watermark <= idleCutoff;
+	});
 	// Codex idempotency: skip jobs whose input_watermark is already covered by
 	// stage1_outputs.source_updated_at (SkippedUpToDate). A retried or duplicate
 	// phase-1 job then marks completed without re-running the LLM.
