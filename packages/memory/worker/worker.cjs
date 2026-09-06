@@ -22,7 +22,7 @@ const { spawn } = require("node:child_process");
 const { SCHEMA, phase1Prompt, completeLLM, parseJsonObj } = require(path.join(__dirname, "..", "lib", "memory-core.cjs"));
 
 const WORKER_ID = `w-${process.pid}`;
-const POLL_MS_DEFAULT = 3000;
+const POLL_MS_DEFAULT = 60_000; // fallback interval when nothing is due (codex: work is triggered, not polled)
 const LEASE_MS = 60 * 60 * 1000;        // 1h lease (codex JOB_LEASE_SECONDS=3600); idempotent retry makes it safe
 const RETRY_DELAY_MS = 60 * 60 * 1000;  // 1h retry backoff (codex JOB_RETRY_DELAY_SECONDS)
 const PHASE2_SUCCESS_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h cooldown (codex)
@@ -391,12 +391,40 @@ async function runPhase2AsAgent(row) {
 
 // ---- main loop ----
 
+function nextWakeMs(now) {
+	// Earliest moment any queued job becomes actionable:
+	// - phase1: input_watermark + idle window (extract once the conversation is idle)
+	// - phase2: retry_until backoff, or cooldown expiry
+	// - fallback: default poll interval
+	const idleMs = MIN_ROLLOUT_IDLE_MS;
+	let earliest = now + POLL_MS_DEFAULT;
+	try {
+		for (const row of db.prepare(
+			`SELECT kind, status, input_watermark, retry_until FROM jobs WHERE status IN ('pending','failed')`,
+		).all()) {
+			if (row.kind === "phase1" && row.input_watermark) {
+				const due = Number(row.input_watermark) + idleMs;
+				if (due < earliest) earliest = due;
+			}
+			if (row.kind === "memory_consolidate_global") {
+				if (row.status === "failed" && row.retry_until) {
+					if (Number(row.retry_until) < earliest) earliest = Number(row.retry_until);
+				}
+			}
+		}
+	} catch { /* best-effort */ }
+	return Math.max(earliest - now, 1000);
+}
+
 async function pollOnce() {
-	if (!db || polling) return;
+	if (!db || polling) return 0;
 	polling = true;
+	let didWork = false;
 	try {
 		// phase 1 jobs
-		for (const row of claimPhase1Jobs()) {
+		const phase1 = claimPhase1Jobs();
+		if (phase1.length > 0) didWork = true;
+		for (const row of phase1) {
 			try { await runPhase1(row); markCompleted(row); }
 			catch (err) { log(`phase1 ${row.job_key} failed:`, err.message); markFailed(row, err.message); }
 		}
@@ -404,6 +432,7 @@ async function pollOnce() {
 		let claim = claimPhase2();
 		if (claim.outcome === "recycled") claim = claimPhase2(); // retry after pending reset
 		if (claim.outcome === "claimed") {
+			didWork = true;
 			try { await runPhase2AsAgent(claim.row); }
 			catch (err) { log("phase2 unexpected error:", err.message); markPhase2Failed(claim.row, err.message); }
 		} else if (claim.outcome !== "no_job" && claim.outcome !== "skipped_cooldown" && claim.outcome !== "skipped_running" && claim.outcome !== "skipped_retry_backoff") {
@@ -414,70 +443,22 @@ async function pollOnce() {
 	} finally {
 		polling = false;
 	}
+	return didWork ? 1 : 0;
 }
 
 function startLoop() {
 	prepareMemoryWorkspace(); // baseline must exist BEFORE phase-1 writes (codex: prepare_memory_workspace at startup)
-	const ms = cfg?.pollMs ?? POLL_MS_DEFAULT;
-	setInterval(() => { void pollOnce(); }, ms);
-	void pollOnce();
+	// Codex is event-driven (work is spawned per turn), so a fixed fast poll
+	// wastes cycles — especially with the 6h idle gate. Sleep until the next
+	// actionable job: after a busy poll poll again soon (work may chain),
+	// otherwise sleep to the earliest due time or the fallback interval.
+	const schedule = async () => {
+		const worked = await pollOnce();
+		const delay = worked ? 1000 : nextWakeMs(Date.now());
+		setTimeout(() => { void schedule(); }, delay);
+	};
+	void schedule();
 }
-
-let shuttingDown = false;
-
-function drainAndExit() {
-	if (shuttingDown) return;
-	shuttingDown = true;
-	log("shutdown requested; draining pending jobs before exit");
-	// Give the in-flight poll time to finish; a phase-1 LLM call may take a
-	// while, so allow up to GRACE_MS. In print/CI mode the pi process has
-	// already exited, but the worker is a forked child and survives it — it
-	// only exits once the queue is drained or the grace period elapses.
-	(async () => {
-		for (let i = 0; i < 40; i++) {
-			await pollOnce();
-			const pending = db.prepare(
-				`SELECT COUNT(*) AS n FROM jobs WHERE status IN ('pending','failed') AND (retry_until IS NULL OR retry_until <= ?)`,
-			).get(Date.now()).n;
-			if (pending === 0) {
-				log("queue drained; exiting");
-				process.exit(0);
-				return;
-			}
-			await new Promise((r) => setTimeout(r, 1000));
-		}
-		log("grace period elapsed with pending jobs; exiting");
-		process.exit(0);
-	})();
-}
-
-function releaseOwnLeases() {
-	if (!db) return;
-	try {
-		const now = Date.now();
-		// Requeue any job we hold whose lease is still active — a dying worker
-		// must not leave jobs stranded for the full lease duration.
-		const res = db.prepare(
-			`UPDATE jobs SET status='pending', worker_id=NULL, ownership_token=NULL, lease_until=NULL, started_at=NULL
-			 WHERE status='leased' AND worker_id = ? AND lease_until > ?`,
-		).run(WORKER_ID, now);
-		if (res.changes > 0) log(`released ${res.changes} stranded leased job(s) owned by ${WORKER_ID}`);
-	} catch {
-		/* best-effort on exit */
-	}
-}
-
-process.on("exit", () => {
-	releaseOwnLeases();
-});
-process.on("SIGTERM", () => {
-	releaseOwnLeases();
-	process.exit(0);
-});
-process.on("SIGINT", () => {
-	releaseOwnLeases();
-	process.exit(0);
-});
 
 process.on("message", (msg) => {
 	if (!msg) return;
