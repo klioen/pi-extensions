@@ -35,6 +35,11 @@ let db = null;
 let polling = false;
 
 function log(...args) { console.error(`[pi-memory-worker]`, ...args); }
+// Normal operation is quiet; only errors and key state changes hit the footer.
+// Set PI_MEMORY_DEBUG=1 to see the full noisy trace.
+function debug(...args) {
+	if (process.env.PI_MEMORY_DEBUG === "1") console.error(`[pi-memory-worker]`, ...args);
+}
 
 function openDb() {
 	db = new DatabaseSync(cfg.dbPath);
@@ -85,7 +90,7 @@ function claimPhase1Jobs() {
 	for (const row of upToDate) {
 		// job was never claimed, so no ownership token — update status directly
 		db.prepare(`UPDATE jobs SET status='completed', finished_at=? WHERE kind='phase1' AND job_key=?`).run(Date.now(), row.job_key);
-		log(`phase1 ${row.job_key}: up-to-date (watermark ${row.input_watermark}), skipping`);
+		debug(`phase1 ${row.job_key}: up-to-date (watermark ${row.input_watermark}), skipping`);
 	}
 	const eligible = rows.filter((row) => !upToDate.includes(row));
 	const stmt = db.prepare(
@@ -188,7 +193,7 @@ function claimPhase2() {
 }
 
 function markPhase2Failed(row, errMsg) {
-	log("markPhase2Failed row:", JSON.stringify(row));
+	debug("markPhase2Failed row:", JSON.stringify(row));
 	db.prepare(
 		`UPDATE jobs SET status='failed', last_error=?, retry_until=?, retry_remaining=retry_remaining-1, lease_until=NULL
        WHERE kind=? AND job_key=? AND ownership_token=?`,
@@ -196,7 +201,7 @@ function markPhase2Failed(row, errMsg) {
 }
 
 function markPhase2Completed(row) {
-	log("markPhase2Completed row:", JSON.stringify(row));
+	debug("markPhase2Completed row:", JSON.stringify(row));
 	const now = Date.now();
 	db.prepare(
 		`UPDATE jobs SET status='completed', finished_at=?, lease_until=NULL WHERE kind=? AND job_key=? AND ownership_token=?`,
@@ -235,7 +240,7 @@ async function runPhase1(row) {
      ON CONFLICT(thread_id) DO UPDATE SET source_updated_at=excluded.source_updated_at, raw_memory=excluded.raw_memory,
        rollout_summary=excluded.rollout_summary, rollout_slug=excluded.rollout_slug, cwd=excluded.cwd`,
 	).run(payload.threadId, sourceUpdatedAt, parsed.raw_memory, parsed.rollout_summary, parsed.rollout_slug ?? null, payload.rolloutCwd);
-	log(`phase1 done: ${payload.threadId} -> stage1_outputs (watermark ${sourceUpdatedAt})`);
+	debug(`phase1 done: ${payload.threadId} -> stage1_outputs (watermark ${sourceUpdatedAt})`);
 	// phase-1 success advances the phase-2 watermark (codex: enqueue_global_consolidation)
 	enqueuePhase2();
 }
@@ -386,7 +391,7 @@ async function runPhase2AsAgent(row) {
 	// git diff decides whether consolidation has work.
 	materializePhase2Inputs();
 	if (!workspaceHasChanges()) {
-		log("phase2: no workspace changes since last consolidation; skipping LLM");
+		debug("phase2: no workspace changes since last consolidation; skipping LLM");
 		markPhase2Completed(row);
 		return;
 	}
@@ -525,7 +530,7 @@ function releaseOwnLeases() {
 			`UPDATE jobs SET status='pending', worker_id=NULL, ownership_token=NULL, lease_until=NULL, started_at=NULL
 			 WHERE status='leased' AND worker_id = ? AND lease_until > ?`,
 		).run(WORKER_ID, now);
-		if (res.changes > 0) log(`released ${res.changes} stranded leased job(s) owned by ${WORKER_ID}`);
+		if (res.changes > 0) debug(`released ${res.changes} stranded leased job(s) owned by ${WORKER_ID}`);
 	} catch {
 		/* best-effort on exit */
 	}
@@ -534,7 +539,7 @@ function releaseOwnLeases() {
 function drainAndExit() {
 	if (shuttingDown) return;
 	shuttingDown = true;
-	log("shutdown requested; draining pending jobs before exit");
+	debug("shutdown requested; draining pending jobs before exit");
 	(async () => {
 		for (let i = 0; i < 40; i++) {
 			await pollOnce();
@@ -542,13 +547,13 @@ function drainAndExit() {
 				`SELECT COUNT(*) AS n FROM jobs WHERE status IN ('pending','failed') AND (retry_until IS NULL OR retry_until <= ?)`,
 			).get(Date.now()).n;
 			if (pending === 0) {
-				log("queue drained; exiting");
+				debug("queue drained; exiting");
 				process.exit(0);
 				return;
 			}
 			await new Promise((r) => setTimeout(r, 1000));
 		}
-		log("grace period elapsed with pending jobs; exiting");
+		debug("grace period elapsed with pending jobs; exiting");
 		process.exit(0);
 	})();
 }
@@ -563,7 +568,7 @@ process.on("message", (msg) => {
 		cfg = msg.config;
 		openDb();
 		ensureLayout();
-		log(`configured: db=${cfg.dbPath} model=${cfg.llm?.model} poll=${cfg?.pollMs ?? POLL_MS_DEFAULT}ms`);
+		debug(`configured: db=${cfg.dbPath} model=${cfg.llm?.model} poll=${cfg?.pollMs ?? POLL_MS_DEFAULT}ms`);
 		startLoop();
 	} else if (msg.type === "shutdown") {
 		drainAndExit();
@@ -571,7 +576,7 @@ process.on("message", (msg) => {
 });
 
 process.on("disconnect", () => {
-	log("parent disconnected; draining before exit");
+	debug("parent disconnected; draining before exit");
 	drainAndExit();
 });
 
