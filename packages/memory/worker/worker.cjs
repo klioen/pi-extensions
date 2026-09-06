@@ -395,6 +395,34 @@ function startLoop() {
 	void pollOnce();
 }
 
+let shuttingDown = false;
+
+function drainAndExit() {
+	if (shuttingDown) return;
+	shuttingDown = true;
+	log("shutdown requested; draining pending jobs before exit");
+	// Give the in-flight poll time to finish; a phase-1 LLM call may take a
+	// while, so allow up to GRACE_MS. In print/CI mode the pi process has
+	// already exited, but the worker is a forked child and survives it — it
+	// only exits once the queue is drained or the grace period elapses.
+	(async () => {
+		for (let i = 0; i < 40; i++) {
+			await pollOnce();
+			const pending = db.prepare(
+				`SELECT COUNT(*) AS n FROM jobs WHERE status IN ('pending','failed') AND (retry_until IS NULL OR retry_until <= ?)`,
+			).get(Date.now()).n;
+			if (pending === 0) {
+				log("queue drained; exiting");
+				process.exit(0);
+				return;
+			}
+			await new Promise((r) => setTimeout(r, 1000));
+		}
+		log("grace period elapsed with pending jobs; exiting");
+		process.exit(0);
+	})();
+}
+
 process.on("message", (msg) => {
 	if (!msg) return;
 	if (msg.type === "config") {
@@ -404,14 +432,13 @@ process.on("message", (msg) => {
 		log(`configured: db=${cfg.dbPath} model=${cfg.llm?.model} poll=${cfg?.pollMs ?? POLL_MS_DEFAULT}ms`);
 		startLoop();
 	} else if (msg.type === "shutdown") {
-		log("shutting down");
-		process.exit(0);
+		drainAndExit();
 	}
 });
 
 process.on("disconnect", () => {
-	log("parent disconnected; exiting");
-	process.exit(0);
+	log("parent disconnected; draining before exit");
+	drainAndExit();
 });
 
 setTimeout(() => {
