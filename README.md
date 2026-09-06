@@ -48,6 +48,27 @@ export ARK_API_KEYS="key1,key2,key3"        # comma-separated pool (or ARK_API_K
 
 Config (env): `ARK_API_KEYS`, `ARK_API_KEY[_2.._N]`, `PI_FAILOVER_PROVIDER` (default `ark`), `PI_FAILOVER_COOLDOWN_MS` (default 60000).
 
+### pi-memory — `packages/memory`
+
+Local markdown-file memory for pi, modeled after **Codex's memory system** (`codex-rs/memories/write` + `ext/memories`): progressive disclosure over a plain directory, with a two-phase LLM distillation pipeline and per-turn recall injection. No server, no proxy.
+
+**Storage layout** (under `~/.pi/agent/memories/` or `PI_MEMORY_DIR`):
+
+- `memory_summary.md` — dense, always injected into the system prompt; first line must be `v1`
+- `MEMORY.md` — durable handbook; `# Task Group` blocks with `scope:`/`applies_to:` headers, per-task `rollout_summary_files` + `keywords`, and consolidated `## User preferences` / `## Reusable knowledge` / `## Failures and how to do differently` sections
+- `raw_memories.md` — merged phase-1 outputs (phase-2 input)
+- `rollout_summaries/<timestamp>-<slug>.md` — per-conversation distilled recaps
+- `skills/<name>/` — optional reusable procedures (`SKILL.md` packages)
+
+**Pipeline** (both phases are tool-less LLM sessions, exactly like Codex):
+
+- **Phase 1** (per `agent_settled`, low reasoning): distills new conversation turns into `{raw_memory, rollout_summary, rollout_slug}` — with `Preference signals:` / `Reusable knowledge:` / `Failures and how to do differently:` sections — appended to `raw_memories.md` and `rollout_summaries/`. Sync state persists in the session file (no duplicate extraction across turns/resumes).
+- **Phase 2** (every N phase-1 runs, default 3, or `/memory consolidate`, medium reasoning): consolidates raw memories + existing artifacts + a git-style workspace diff into fresh `MEMORY.md` and `memory_summary.md`; drives incremental updates and forgetting (deleted rollout inputs → surgical memory cleanup).
+
+**Recall** (every `before_agent_start`): `memory_summary.md` is injected into the system prompt with a decision boundary ("skip memory only when clearly self-contained") and a lightweight quick-pass (≤4–6 search steps), mirroring Codex's `read_path.md`.
+
+Config (env): `PI_MEMORY_DIR`, `PI_MEMORY_AUTO=0` (disable phase 1), `PI_MEMORY_RECALL=0` (disable injection), `PI_MEMORY_CONSOLIDATE_EVERY`, `PI_MEMORY_SUMMARY_TOKENS`, `PI_MEMORY_ROLLOUT_CHARS`, `PI_MEMORY_MEMORY_CHARS`.
+
 ## Install
 
 Single packages (local paths):

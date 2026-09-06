@@ -1,0 +1,15 @@
+{
+	"name": "pi-memory",
+	"version": "0.2.0",
+	"description": "Local markdown-file memory for pi, modeled after Codex's memory design: two-phase LLM distillation (per-rollout phase 1, consolidation phase 2), progressive disclosure via memory_summary.md / MEMORY.md / rollout_summaries / skills.",
+	"type": "module",
+	"keywords": ["pi-package"],
+	"pi": {
+		"extensions": ["./extensions"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-agent-core": "*",
+		"typebox": "*"
+	}
+}
