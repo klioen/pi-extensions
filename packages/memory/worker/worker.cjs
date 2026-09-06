@@ -28,7 +28,7 @@ const RETRY_DELAY_MS = 60 * 60 * 1000;  // 1h retry backoff (codex JOB_RETRY_DEL
 const PHASE2_SUCCESS_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h cooldown (codex)
 const PHASE2_AGENT_TIMEOUT_MS = 10 * 60 * 1000;
 const CONCURRENCY = 4;
-const MIN_ROLLOUT_IDLE_MS = (Number(process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS) || 6) * 3600 * 1000; // codex default 6h
+const MIN_ROLLOUT_IDLE_MS = (process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS === undefined ? 6 : Number(process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS)) * 3600 * 1000; // codex default 6h; explicit 0 disables the idle gate
 
 let cfg = null;
 let db = null;

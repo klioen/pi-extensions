@@ -49,7 +49,7 @@ const AUTO_ENQUEUE = process.env.PI_MEMORY_AUTO !== "0";
 const SUMMARY_TOKEN_LIMIT = Math.max(500, Number(process.env.PI_MEMORY_SUMMARY_TOKENS) || 4000);
 const ROLLOUT_CHAR_LIMIT = Math.max(4000, Number(process.env.PI_MEMORY_ROLLOUT_CHARS) || 20000);
 const EXTRACT_MODEL = process.env.PI_MEMORY_EXTRACT_MODEL || ""; // optional override, like codex extract_model
-const MIN_ROLLOUT_IDLE_HOURS = Math.max(0, Number(process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS) ?? 6); // codex DEFAULT_MEMORIES_MIN_ROLLOUT_IDLE_HOURS=6
+const MIN_ROLLOUT_IDLE_HOURS = process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS === undefined ? 6 : Math.max(0, Number(process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS)); // codex default 6h; explicit 0 disables
 const WORKER_POLL_MS = Math.max(500, Number(process.env.PI_MEMORY_WORKER_POLL_MS) || 3000);
 
 // DB state keys
