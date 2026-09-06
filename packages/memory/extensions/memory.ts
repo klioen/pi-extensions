@@ -49,6 +49,7 @@ const AUTO_ENQUEUE = process.env.PI_MEMORY_AUTO !== "0";
 const SUMMARY_TOKEN_LIMIT = Math.max(500, Number(process.env.PI_MEMORY_SUMMARY_TOKENS) || 4000);
 const ROLLOUT_CHAR_LIMIT = Math.max(4000, Number(process.env.PI_MEMORY_ROLLOUT_CHARS) || 20000);
 const EXTRACT_MODEL = process.env.PI_MEMORY_EXTRACT_MODEL || ""; // optional override, like codex extract_model
+const MIN_ROLLOUT_IDLE_HOURS = Math.max(0, Number(process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS) || 0); // codex min_rollout_idle_hours
 const WORKER_POLL_MS = Math.max(500, Number(process.env.PI_MEMORY_WORKER_POLL_MS) || 3000);
 
 // DB state keys
@@ -103,11 +104,15 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status_lease ON jobs(status, lease_until);
 }
 
 function enqueueJob(kind: string, jobKey: string, payload: unknown): void {
+	enqueueJobWithWatermark(kind, jobKey, 0, payload);
+}
+
+function enqueueJobWithWatermark(kind: string, jobKey: string, inputWatermark: number, payload: unknown): void {
 	const d = getDb();
 	d.prepare(
-		`INSERT OR REPLACE INTO jobs (kind, job_key, status, retry_remaining, payload, created_at)
-     VALUES (?, ?, 'pending', 3, ?, ?)`,
-	).run(kind, jobKey, JSON.stringify(payload), Date.now());
+		`INSERT OR REPLACE INTO jobs (kind, job_key, status, retry_remaining, payload, input_watermark, created_at)
+     VALUES (?, ?, 'pending', 3, ?, ?, ?)`,
+	).run(kind, jobKey, JSON.stringify(payload), inputWatermark, Date.now());
 }
 
 function upsertState(key: string, value: unknown): void {
@@ -135,6 +140,7 @@ function readState<T>(key: string, fallback: T): T {
 
 interface SyncMsg {
 	entryId: string;
+	ts: number; // entry timestamp (ms), used as the phase-1 input watermark
 	role: "user" | "assistant";
 	content: string;
 }
@@ -154,7 +160,8 @@ function collectMessages(sm: { getEntries: () => unknown[]; getLeafId: () => str
 			.join(" ")
 			.trim();
 		if (!text) continue;
-		out.push({ entryId: entry.id, role: message.role, content: text });
+		const ts = Date.parse((entry as { timestamp?: string }).timestamp ?? "");
+		out.push({ entryId: entry.id, ts: Number.isFinite(ts) ? ts : 0, role: message.role, content: text });
 	}
 	return out;
 }
@@ -316,11 +323,26 @@ export default function (pi: ExtensionAPI) {
 				const threadId = String(sm.getSessionId?.() ?? "pi");
 				const phase1Count = state.phase1Count + 1;
 
-				// Enqueue a phase-1 job; worker claims and executes asynchronously.
+				// Codex min_rollout_idle_hours: only extract after the conversation
+				// has been idle for N hours. Default 0 = extract immediately after
+				// each turn, which is the pi analog of a completed rollout.
+				if (MIN_ROLLOUT_IDLE_HOURS > 0) {
+					const lastTs = fresh[fresh.length - 1].ts || 0;
+					if (lastTs > 0 && Date.now() - lastTs < MIN_ROLLOUT_IDLE_HOURS * 3600_000) {
+						// conversation still fresh; skip phase-1 this turn
+						return;
+					}
+				}
+
+				// Enqueue a phase-1 job with the input watermark set to the latest
+				// message timestamp. The worker claims and executes asynchronously;
+				// Codex-aligned idempotency (stage1_outputs.source_updated_at >=
+				// input_watermark) lets a retried/duplicate job skip harmlessly.
 				// Phase-2 consolidation is triggered by the worker itself after a
 				// phase-1 success (watermark advance), gated by cooldown/backoff —
 				// exactly like Codex's global phase-2 singleton job.
-				enqueueJob("phase1", threadId, {
+				const inputWatermark = fresh[fresh.length - 1].ts || 0;
+				enqueueJobWithWatermark("phase1", threadId, inputWatermark, {
 					transcript,
 					rolloutPath: String(sm.getSessionFile?.() ?? ""),
 					rolloutCwd: ctx.cwd,
