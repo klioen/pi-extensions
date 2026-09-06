@@ -23,7 +23,7 @@ const { SCHEMA, phase1Prompt, completeLLM, parseJsonObj } = require(path.join(__
 
 const WORKER_ID = `w-${process.pid}`;
 const POLL_MS_DEFAULT = 3000;
-const LEASE_MS = 60 * 60 * 1000;        // 1h lease (codex JOB_LEASE_SECONDS=3600)
+const LEASE_MS = 5 * 60 * 1000;         // 5min lease (phase1 is a single short LLM call; 1h was too slow to self-heal)
 const RETRY_DELAY_MS = 60 * 60 * 1000;  // 1h retry backoff (codex JOB_RETRY_DELAY_SECONDS)
 const PHASE2_SUCCESS_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h cooldown (codex)
 const PHASE2_AGENT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -422,6 +422,34 @@ function drainAndExit() {
 		process.exit(0);
 	})();
 }
+
+function releaseOwnLeases() {
+	if (!db) return;
+	try {
+		const now = Date.now();
+		// Requeue any job we hold whose lease is still active — a dying worker
+		// must not leave jobs stranded for the full lease duration.
+		const res = db.prepare(
+			`UPDATE jobs SET status='pending', worker_id=NULL, ownership_token=NULL, lease_until=NULL, started_at=NULL
+			 WHERE status='leased' AND worker_id = ? AND lease_until > ?`,
+		).run(WORKER_ID, now);
+		if (res.changes > 0) log(`released ${res.changes} stranded leased job(s) owned by ${WORKER_ID}`);
+	} catch {
+		/* best-effort on exit */
+	}
+}
+
+process.on("exit", () => {
+	releaseOwnLeases();
+});
+process.on("SIGTERM", () => {
+	releaseOwnLeases();
+	process.exit(0);
+});
+process.on("SIGINT", () => {
+	releaseOwnLeases();
+	process.exit(0);
+});
 
 process.on("message", (msg) => {
 	if (!msg) return;
