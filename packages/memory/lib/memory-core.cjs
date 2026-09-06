@@ -80,6 +80,7 @@ function parseJsonObj(final) {
 		const start = cleaned.indexOf("{");
 		if (start < 0) return null;
 		let end = cleaned.lastIndexOf("}");
+		// Pass 1: plain JSON.parse on each candidate closing brace.
 		while (end > start) {
 			try {
 				return JSON.parse(cleaned.slice(start, end + 1));
@@ -87,10 +88,57 @@ function parseJsonObj(final) {
 				end = cleaned.lastIndexOf("}", end - 1);
 			}
 		}
+		// Pass 2: repair common model-output issues (bare newlines/quotes inside
+		// string values, trailing commas, single-quoted keys, JS-style comments).
+		const repaired = repairJsonText(cleaned);
+		const start2 = repaired.indexOf("{");
+		let end2 = repaired.lastIndexOf("}");
+		while (end2 > start2) {
+			try {
+				return JSON.parse(repaired.slice(start2, end2 + 1));
+			} catch {
+				end2 = repaired.lastIndexOf("}", end2 - 1);
+			}
+		}
 		return null;
 	} catch {
 		return null;
 	}
+}
+
+/** Best-effort JSON repair for LLM output (jsonrepair-lite). */
+function repairJsonText(text) {
+	let s = text;
+	// normalize newlines inside strings: replace literal newline in string values with \n
+	// (naive but effective for the common "raw JSON with embedded newlines" case)
+	let repaired = "";
+	let inString = false;
+	for (let i = 0; i < s.length; i++) {
+		const ch = s[i];
+		if (ch === '"' && (i === 0 || s[i - 1] !== "\\")) {
+			inString = !inString;
+			repaired += ch;
+			continue;
+		}
+		if (inString && (ch === "\n" || ch === "\r")) {
+			repaired += "\\n";
+			continue;
+		}
+		repaired += ch;
+	}
+	// strip // and /* */ comments outside strings (rare in model output)
+	repaired = repaired.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+	// remove trailing commas before } or ]
+	repaired = repaired.replace(/,([\s]*[}\]])/g, "$1");
+	// single-quoted keys and values (model output shorthand): convert to double quotes.
+	// Pattern A: 'key': -> "key":
+	repaired = repaired.replace(/([\{, ])'([^']+)'(\s*:)/g, '$1"$2"$3');
+	// Pattern B: : 'value' -> : "value"
+	repaired = repaired.replace(/(:\s*)'([^']*)'/g, '$1"$2"');
+	// Pattern C: bare key : (already handled when the key is quoted; also cover
+	// identifier-like bare keys seen after { or ,)
+	repaired = repaired.replace(/([\{,])\s*([A-Za-z_][A-Za-z0-9_]*)(\s*:)/g, '$1"$2"$3');
+	return repaired;
 }
 
 /**

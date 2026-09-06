@@ -187,7 +187,7 @@ function startWorker(ctxModel: unknown): void {
 	if (worker) return;
 	const workerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "worker", "worker.cjs");
 	workerConfig = { dbPath: DB_PATH, memDir: MEMORY_DIR, pollMs: WORKER_POLL_MS, llm: resolveExtractModel(ctxModel) };
-	worker = fork(workerPath, [], { stdio: ["ignore", "ignore", "inherit", "ipc"] });
+	worker = fork(workerPath, [], { stdio: ["ignore", "ignore", "inherit", "ipc"], execArgv: ["--no-warnings"] });
 	worker.send({ type: "config", config: workerConfig });
 	worker.on("exit", (code, signal) => {
 		worker = null;
