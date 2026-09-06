@@ -225,6 +225,57 @@ async function runPhase1(row) {
 
 // ---- phase-2 executor: run a full pi agent (with tools) ----
 
+// Codex-aligned git baseline for the memory workspace.
+// - ensure the memories root is a git repo with an initial baseline commit
+//   (codex: prepare_memory_workspace)
+// - workspaceHasChanges() mirrors codex's memory_workspace_diff().has_changes():
+//   phase 2 is skipped (no LLM) when the workspace is clean
+// - resetMemoryBaseline() commits a fresh baseline after a successful
+//   consolidation (codex: reset_memory_workspace_baseline)
+function git(cmd) {
+	const { execSync } = require("node:child_process");
+	return execSync(`git -C "${cfg.memDir}" ${cmd}`, { encoding: "utf8", timeout: 10000 });
+}
+
+function prepareMemoryWorkspace() {
+	const gitDir = path.join(cfg.memDir, ".git");
+	const gitignore = path.join(cfg.memDir, ".gitignore");
+	try {
+		if (!fs.existsSync(gitignore)) {
+			fs.writeFileSync(gitignore, "memory.db\nmemory.db-wal\nmemory.db-shm\n");
+		}
+		if (!fs.existsSync(gitDir)) {
+			git("init -q");
+			git('config user.name "pi-memory"');
+			git('config user.email "pi-memory@localhost"');
+			git("add -A");
+			git('commit -qm "baseline"');
+			log("memory workspace git baseline initialized");
+		}
+	} catch (err) {
+		log("git baseline init failed:", err.message);
+	}
+}
+
+function workspaceHasChanges() {
+	try {
+		if (!fs.existsSync(path.join(cfg.memDir, ".git"))) return true; // no git → assume work exists
+		return git("status --porcelain").trim().length > 0;
+	} catch {
+		return true;
+	}
+}
+
+function resetMemoryBaseline() {
+	try {
+		git("add -A");
+		git('commit -qm "consolidation baseline"');
+		log("memory workspace baseline reset");
+	} catch (err) {
+		log("git baseline commit failed:", err.message);
+	}
+}
+
 function phase2AgentPrompt(memDir) {
 	return [
 		`You are a Memory Writing Agent. Consolidate raw memories and rollout summaries into the local "agent memory" folder at ${memDir}.`,
@@ -248,11 +299,11 @@ function phase2AgentPrompt(memDir) {
 }
 
 async function runPhase2AsAgent(row) {
-	// Pre-check: has the watermark advanced past what was already consolidated?
-	const lastWatermark = kvGet(P2_WATERMARK, 0);
-	const latestSource = db.prepare(`SELECT COALESCE(MAX(source_updated_at), 0) AS m FROM stage1_outputs`).get().m;
-	if (latestSource <= lastWatermark) {
-		log("phase2: no new inputs since last consolidation; skipping LLM");
+	// Codex-aligned pre-check: the git workspace is the source of truth for
+	// whether consolidation has work. When the workspace is clean (phase-1
+	// inputs already consolidated and baseline committed), skip the LLM.
+	if (!workspaceHasChanges()) {
+		log("phase2: no workspace changes since last consolidation; skipping LLM");
 		markPhase2Completed(row);
 		return;
 	}
@@ -302,6 +353,7 @@ async function runPhase2AsAgent(row) {
 
 	if (result.ok) {
 		log("phase2: consolidation agent finished");
+		resetMemoryBaseline(); // codex: reset_memory_workspace_baseline
 		markPhase2Completed(row);
 	} else {
 		log("phase2 agent failed:", result.error);
@@ -337,6 +389,7 @@ async function pollOnce() {
 }
 
 function startLoop() {
+	prepareMemoryWorkspace(); // baseline must exist BEFORE phase-1 writes (codex: prepare_memory_workspace at startup)
 	const ms = cfg?.pollMs ?? POLL_MS_DEFAULT;
 	setInterval(() => { void pollOnce(); }, ms);
 	void pollOnce();
