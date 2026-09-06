@@ -1,69 +1,78 @@
 #!/usr/bin/env node
 /**
  * pi-memory worker — independent child process that polls the memory SQLite
- * job queue and executes phase-1 / phase-2 LLM distillation jobs.
+ * job queue and executes phase-1 / phase-2 memory distillation jobs.
+ *
+ * Phase 2 (consolidation) is modeled after Codex:
+ *   - global singleton job (kind='memory_consolidate_global'), claimed with a
+ *     lease + ownership token; success cooldown (6h) and retry backoff (1h)
+ *   - executed by a full agent: we fork a `pi --print` child with read/grep/
+ *     bash/edit/write tools so the consolidation agent reads the memory
+ *     workspace and edits MEMORY.md / memory_summary.md itself
+ *   - a watermark pre-check avoids calling the LLM when there is no new input
  *
  * Runs detached from the pi process (child_process.fork), so it survives pi
- * exiting in print/CI mode. Config arrives via IPC message from the parent
- * ({ dbPath, memDir, llm, pollMs }). The LLM call uses plain fetch against an
- * OpenAI-compatible endpoint, so this worker has no dependency on the pi
- * runtime or jiti.
+ * exiting in print/CI mode. Config arrives via IPC from the parent.
  */
 "use strict";
 const { DatabaseSync } = require("node:sqlite");
 const fs = require("node:fs");
 const path = require("node:path");
-const { SCHEMA, phase1Prompt, phase2Prompt, completeLLM, parseJsonObj } = require(path.join(__dirname, "..", "lib", "memory-core.cjs"));
+const { spawn } = require("node:child_process");
+const { SCHEMA, phase1Prompt, completeLLM, parseJsonObj } = require(path.join(__dirname, "..", "lib", "memory-core.cjs"));
 
 const WORKER_ID = `w-${process.pid}`;
 const POLL_MS_DEFAULT = 3000;
-const LEASE_MS = 5 * 60 * 1000; // a job must finish within 5 min of lease
-const RETRY_DELAY_MS = 60 * 1000;
+const LEASE_MS = 60 * 60 * 1000;        // 1h lease (codex JOB_LEASE_SECONDS=3600)
+const RETRY_DELAY_MS = 60 * 60 * 1000;  // 1h retry backoff (codex JOB_RETRY_DELAY_SECONDS)
+const PHASE2_SUCCESS_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h cooldown (codex)
+const PHASE2_AGENT_TIMEOUT_MS = 10 * 60 * 1000;
 const CONCURRENCY = 4;
 
 let cfg = null;
 let db = null;
-let running = true;
 let polling = false;
 
-function log(...args) {
-	console.error(`[pi-memory-worker]`, ...args);
-}
+function log(...args) { console.error(`[pi-memory-worker]`, ...args); }
 
 function openDb() {
 	db = new DatabaseSync(cfg.dbPath);
 	db.exec("PRAGMA journal_mode=WAL;");
 	db.exec(SCHEMA);
+	db.exec(`CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
 }
 
-// ---- job claim / result helpers (mirror codex claim_stage1_jobs) ----
+function kvGet(key, fallback = null) {
+	const row = db.prepare(`SELECT value FROM kv WHERE key = ?`).get(key);
+	return row ? JSON.parse(row.value) : fallback;
+}
+function kvSet(key, value) {
+	db.prepare(`INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`).run(key, JSON.stringify(value));
+}
 
-function claimJobs(kind) {
+// ---- phase-1 job helpers ----
+
+function claimPhase1Jobs() {
 	const now = Date.now();
-	const rows = db
-		.prepare(
-			`SELECT * FROM jobs
-       WHERE kind = ? AND status IN ('pending','failed')
+	const rows = db.prepare(
+		`SELECT * FROM jobs
+       WHERE kind = 'phase1' AND status IN ('pending','failed')
          AND (status = 'pending' OR (retry_until IS NOT NULL AND retry_until <= ?))
          AND (lease_until IS NULL OR lease_until <= ?)
        ORDER BY created_at ASC LIMIT ?`,
-		)
-		.all(kind, now, now, CONCURRENCY);
-	if (rows.length === 0) return rows;
+	).all(now, now, CONCURRENCY);
 	const stmt = db.prepare(
-		`UPDATE jobs SET status='leased', worker_id=?, ownership_token=?, lease_until=? WHERE kind=? AND job_key=? AND status IN ('pending','failed')`,
+		`UPDATE jobs SET status='leased', worker_id=?, ownership_token=?, lease_until=? WHERE kind='phase1' AND job_key=? AND status IN ('pending','failed')`,
 	);
+	const claimed = [];
 	for (const row of rows) {
 		const token = `${WORKER_ID}-${row.job_key}-${Date.now()}`;
-		const upd = stmt.run(WORKER_ID, token, now + LEASE_MS, kind, row.job_key);
-		if (upd.changes === 0) {
-			// lost race; skip
-			row._lost = true;
-			continue;
+		if (stmt.run(WORKER_ID, token, now + LEASE_MS, row.job_key).changes > 0) {
+			row.ownership_token = token;
+			claimed.push(row);
 		}
-		row.ownership_token = token;
 	}
-	return rows.filter((r) => !r._lost);
+	return claimed;
 }
 
 function markCompleted(row) {
@@ -79,7 +88,98 @@ function markFailed(row, errMsg) {
 	).run(String(errMsg).slice(0, 2000), Date.now() + RETRY_DELAY_MS, row.kind, row.job_key, row.ownership_token);
 }
 
-// ---- artifact writes (same layout as before) ----
+// ---- phase-2 global singleton (mirrors codex try_claim_global_phase2_job) ----
+
+const P2_KIND = "memory_consolidate_global";
+const P2_KEY = "consolidation";
+const P2_WATERMARK = "phase2_last_watermark";
+
+/** Enqueue / advance the global phase-2 job watermark (called after phase-1 success). */
+function enqueuePhase2() {
+	const now = Date.now();
+	const existing = db.prepare(`SELECT status, lease_until, retry_until, last_error, finished_at FROM jobs WHERE kind=? AND job_key=?`).get(P2_KIND, P2_KEY);
+	if (!existing) {
+		db.prepare(
+			`INSERT INTO jobs (kind, job_key, status, retry_remaining, payload, input_watermark, created_at)
+       VALUES (?, ?, 'pending', 3, '{}', ?, ?)`,
+		).run(P2_KIND, P2_KEY, now, now);
+		return;
+	}
+	// manual force (from /memory consolidate): reset completed→pending so the
+	// next claim runs immediately (cooldown still applies unless force set)
+	const payloadRow = db.prepare(`SELECT payload FROM jobs WHERE kind=? AND job_key=?`).get(P2_KIND, P2_KEY);
+	let force = false;
+	try { force = !!JSON.parse(payloadRow?.payload ?? "{}").force; } catch { force = false; }
+	if (force) {
+		kvSet("phase2_last_success_at", 0); // bypass 6h cooldown for manual runs
+		db.prepare(`UPDATE jobs SET status='pending', lease_until=NULL, finished_at=NULL, payload='{"force":true}' WHERE kind=? AND job_key=?`).run(P2_KIND, P2_KEY);
+	}
+	// advance watermark on the pending row (or any non-running row)
+	if (existing.status !== "running" || (existing.lease_until ?? 0) <= now) {
+		db.prepare(`UPDATE jobs SET input_watermark = ?, last_error = NULL, retry_until = NULL WHERE kind=? AND job_key=?`).run(now, P2_KIND, P2_KEY);
+	}
+}
+
+function claimPhase2() {
+	const now = Date.now();
+	const cooldownCutoff = now - PHASE2_SUCCESS_COOLDOWN_MS;
+	const row = db.prepare(`SELECT * FROM jobs WHERE kind=? AND job_key=?`).get(P2_KIND, P2_KEY);
+	if (!row) return { outcome: "no_job" };
+	const steal = (statusWhere) => {
+		const token = `${WORKER_ID}-p2-${now}`;
+		const upd = db.prepare(
+			`UPDATE jobs SET status='running', worker_id=?, ownership_token=?, lease_until=?, started_at=?, last_error=NULL
+       WHERE kind=? AND job_key=? AND ${statusWhere}`,
+		).run(WORKER_ID, token, now + LEASE_MS, now, P2_KIND, P2_KEY);
+		if (upd.changes === 0) return { outcome: "skipped_running" };
+		const fresh = db.prepare(`SELECT * FROM jobs WHERE kind=? AND job_key=?`).get(P2_KIND, P2_KEY);
+		return { outcome: "claimed", row: fresh };
+	};
+	if (row.status === "pending") {
+		const lastSuccess = kvGet("phase2_last_success_at", 0);
+		if (lastSuccess > cooldownCutoff) return { outcome: "skipped_cooldown" };
+		return steal("status='pending'");
+	}
+	if (row.status === "running") {
+		if ((row.lease_until ?? 0) > now) return { outcome: "skipped_running" };
+		return steal("status='running'"); // lease expired → steal
+	}
+	if (row.status === "failed") {
+		if ((row.retry_until ?? 0) > now) return { outcome: "skipped_retry_backoff" };
+		return steal("status='failed'");
+	}
+	if (row.status === "completed") {
+		const lastSuccess = kvGet("phase2_last_success_at", 0);
+		const latestSource = db.prepare(`SELECT COALESCE(MAX(source_updated_at), 0) AS m FROM stage1_outputs`).get().m;
+		if (lastSuccess <= cooldownCutoff && latestSource > (row.input_watermark ?? 0)) {
+			db.prepare(`UPDATE jobs SET status='pending', lease_until=NULL, finished_at=NULL WHERE kind=? AND job_key=?`).run(P2_KIND, P2_KEY);
+			return { outcome: "recycled" };
+		}
+		return { outcome: "skipped_cooldown" };
+	}
+	return { outcome: "no_job" };
+}
+
+function markPhase2Failed(row, errMsg) {
+	log("markPhase2Failed row:", JSON.stringify(row));
+	db.prepare(
+		`UPDATE jobs SET status='failed', last_error=?, retry_until=?, retry_remaining=retry_remaining-1, lease_until=NULL
+       WHERE kind=? AND job_key=? AND ownership_token=?`,
+	).run(String(errMsg).slice(0, 2000), Date.now() + RETRY_DELAY_MS, P2_KIND, P2_KEY, row.ownership_token);
+}
+
+function markPhase2Completed(row) {
+	log("markPhase2Completed row:", JSON.stringify(row));
+	const now = Date.now();
+	db.prepare(
+		`UPDATE jobs SET status='completed', finished_at=?, lease_until=NULL WHERE kind=? AND job_key=? AND ownership_token=?`,
+	).run(now, P2_KIND, P2_KEY, row.ownership_token);
+	kvSet("phase2_last_success_at", now);
+	const latestSource = db.prepare(`SELECT COALESCE(MAX(source_updated_at), 0) AS m FROM stage1_outputs`).get().m;
+	kvSet(P2_WATERMARK, latestSource);
+}
+
+// ---- phase-1 executor ----
 
 function ensureLayout() {
 	for (const p of [cfg.memDir, path.join(cfg.memDir, "rollout_summaries"), path.join(cfg.memDir, "skills")]) {
@@ -98,115 +198,113 @@ function writePhase1Artifacts(output, cwd, threadId) {
 	const ts = new Date().toISOString().replace(/[:.]/g, "-");
 	const slug = (output.rollout_slug?.trim() || "").replace(/[^\w-]+/g, "-").replace(/^-+|-+$/g, "") || "rollout";
 	const file = path.join(cfg.memDir, "rollout_summaries", `${ts}-${slug}.md`);
-	fs.writeFileSync(
-		file,
-		[
-			`# ${slug}`,
-			``,
-			`- thread_id: ${threadId}`,
-			`- updated_at: ${new Date().toISOString()}`,
-			`- cwd: ${cwd}`,
-			``,
-			output.rollout_summary?.trim() ?? "",
-			``,
-		].join("\n"),
-	);
+	fs.writeFileSync(file, [`# ${slug}`, "", `- thread_id: ${threadId}`, `- updated_at: ${new Date().toISOString()}`, `- cwd: ${cwd}`, "", output.rollout_summary?.trim() ?? "", ""].join("\n"));
 	const raw = fs.readFileSync(path.join(cfg.memDir, "raw_memories.md"), "utf8");
-	const append = [
-		``,
-		`## Thread \`${threadId}\` (${ts})`,
-		``,
-		`updated_at: ${new Date().toISOString()}`,
-		`cwd: ${cwd}`,
-		`rollout_summary_file: ${path.relative(cfg.memDir, file)}`,
-		``,
-		output.raw_memory?.trim() ?? "",
-		``,
-	].join("\n");
+	const append = ["", `## Thread \`${threadId}\` (${ts})`, "", `updated_at: ${new Date().toISOString()}`, `cwd: ${cwd}`, `rollout_summary_file: ${path.relative(cfg.memDir, file)}`, "", output.raw_memory?.trim() ?? "", ""].join("\n");
 	fs.writeFileSync(path.join(cfg.memDir, "raw_memories.md"), raw.replace(/\s*$/, "\n") + append);
 	return path.relative(cfg.memDir, file);
 }
 
-function readFile(name) {
-	const p = path.join(cfg.memDir, name);
-	return fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
-}
-
-function computeDiff() {
-	try {
-		const gitDir = path.join(cfg.memDir, ".git");
-		if (fs.existsSync(gitDir)) {
-			const { execSync } = require("node:child_process");
-			const out = execSync(`git -C "${cfg.memDir}" status --short && echo ---- && git -C "${cfg.memDir}" diff --stat`, {
-				encoding: "utf8",
-				timeout: 5000,
-			});
-			return out.trim() || "(no changes)";
-		}
-	} catch {
-		/* fall through */
-	}
-	return "(no workspace diff available)";
-}
-
-function writeSummaryEnsuringV1(summary) {
-	let s = summary.trim();
-	if (!s.startsWith("v1")) s = "v1\n\n" + s.replace(/^## /, "## ");
-	fs.writeFileSync(path.join(cfg.memDir, "memory_summary.md"), s + "\n");
-}
-
-// ---- job executors ----
-
 async function runPhase1(row) {
 	const payload = JSON.parse(row.payload);
-	const { transcript, rolloutPath, rolloutCwd, threadId } = payload;
-	const prompt = phase1Prompt(transcript, rolloutPath, rolloutCwd);
+	const prompt = phase1Prompt(payload.transcript, payload.rolloutPath, payload.rolloutCwd);
 	const raw = await completeLLM(cfg.llm, prompt);
 	const parsed = parseJsonObj(raw);
-	if (!parsed || (!parsed.raw_memory && !parsed.rollout_summary)) {
-		throw new Error("phase1 LLM output unparseable or empty");
-	}
-	// persist to stage1_outputs + artifacts
+	if (!parsed || (!parsed.raw_memory && !parsed.rollout_summary)) throw new Error("phase1 LLM output unparseable or empty");
 	db.prepare(
 		`INSERT INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, rollout_slug, cwd)
      VALUES (?, ?, ?, ?, ?, ?)
-     ON CONFLICT(thread_id) DO UPDATE SET
-       source_updated_at=excluded.source_updated_at,
-       raw_memory=excluded.raw_memory,
-       rollout_summary=excluded.rollout_summary,
-       rollout_slug=excluded.rollout_slug,
-       cwd=excluded.cwd`,
-	).run(threadId, Date.now(), parsed.raw_memory, parsed.rollout_summary, parsed.rollout_slug ?? null, rolloutCwd);
-	const file = writePhase1Artifacts(parsed, rolloutCwd, threadId);
+     ON CONFLICT(thread_id) DO UPDATE SET source_updated_at=excluded.source_updated_at, raw_memory=excluded.raw_memory,
+       rollout_summary=excluded.rollout_summary, rollout_slug=excluded.rollout_slug, cwd=excluded.cwd`,
+	).run(payload.threadId, Date.now(), parsed.raw_memory, parsed.rollout_summary, parsed.rollout_slug ?? null, payload.rolloutCwd);
+	const file = writePhase1Artifacts(parsed, payload.rolloutCwd, payload.threadId);
 	log(`phase1 done: ${file}`);
+	// phase-1 success advances the phase-2 watermark (codex: enqueue_global_consolidation)
+	enqueuePhase2();
 }
 
-async function runPhase2(row) {
-	const payload = JSON.parse(row.payload);
-	const existingMemory = readFile("MEMORY.md").slice(0, 30000);
-	const existingSummary = readFile("memory_summary.md").slice(0, 16000);
-	const newRaw = readFile("raw_memories.md").slice(0, 20000);
-	const diffText = computeDiff();
-	const prompt = phase2Prompt(existingMemory, existingSummary, newRaw, diffText);
-	const raw = await completeLLM(cfg.llm, prompt);
-	const parsed = parseJsonObj(raw);
-	if (!parsed || (!parsed.memory_md && !parsed.summary_md)) {
-		throw new Error("phase2 LLM output unparseable or empty");
+// ---- phase-2 executor: run a full pi agent (with tools) ----
+
+function phase2AgentPrompt(memDir) {
+	return [
+		`You are a Memory Writing Agent. Consolidate raw memories and rollout summaries into the local "agent memory" folder at ${memDir}.`,
+		``,
+		`Read these inputs with the read/grep tools (do not assume their contents):`,
+		`- ${memDir}/raw_memories.md   (merged phase-1 outputs; primary input)`,
+		`- ${memDir}/MEMORY.md          (existing handbook; update it)`,
+		`- ${memDir}/memory_summary.md  (existing summary; first line must stay exactly "v1")`,
+		`- ${path.join(memDir, "rollout_summaries")}/  (per-rollout recaps; open when needed)`,
+		`- ${path.join(memDir, "skills")}/  (reusable procedures; optional)`,
+		``,
+		`Then EDIT the files with the edit/write tools:`,
+		`1. MEMORY.md — durable handbook. Each block starts with "# Task Group: <cwd/project/workflow>" plus scope: and applies_to: lines; body has "## Task <n>" sections with "### rollout_summary_files" and "### keywords", then block-level "## User preferences" / "## Reusable knowledge" / "## Failures and how to do differently" when meaningful. Preserve original user wording, error strings, commands (grep-ability).`,
+		`2. memory_summary.md — must start exactly with "v1". Sections: "## User Profile" (<=350 words), "## User preferences" (actionable bullets), "## General Tips", "## What's in Memory" (routing index with keywords).`,
+		`3. Optionally create/update skills/ when there is a clearly reusable procedure.`,
+		``,
+		`Rules (STRICT): evidence-based only; redact secrets ([REDACTED_SECRET]); do not copy large tool outputs verbatim; if there is no meaningful new signal, make minimal or no changes; keep files dense and navigation-friendly.`,
+		``,
+		`Do not modify raw_memories.md or rollout_summaries/. When done, stop.`,
+	].join("\n");
+}
+
+async function runPhase2AsAgent(row) {
+	// Pre-check: has the watermark advanced past what was already consolidated?
+	const lastWatermark = kvGet(P2_WATERMARK, 0);
+	const latestSource = db.prepare(`SELECT COALESCE(MAX(source_updated_at), 0) AS m FROM stage1_outputs`).get().m;
+	if (latestSource <= lastWatermark) {
+		log("phase2: no new inputs since last consolidation; skipping LLM");
+		markPhase2Completed(row);
+		return;
 	}
-	if (parsed.memory_md?.trim()) fs.writeFileSync(path.join(cfg.memDir, "MEMORY.md"), parsed.memory_md.trim() + "\n");
-	if (parsed.summary_md?.trim()) writeSummaryEnsuringV1(parsed.summary_md);
-	log("phase2 consolidated MEMORY.md + memory_summary.md");
-}
 
-async function executeJob(row) {
-	try {
-		if (row.kind === "phase1") await runPhase1(row);
-		else if (row.kind === "phase2") await runPhase2(row);
-		else throw new Error(`unknown job kind: ${row.kind}`);
-		markCompleted(row);
-	} catch (err) {
-		log(`job ${row.kind}/${row.job_key} failed:`, err.message);
-		markFailed(row, err.message);
+	// Model selection for the consolidation agent: prefer explicit env, else derived from worker llm config
+	const modelSpec = cfg.llm.phase2Model || cfg.llm.model;
+	const prompt = phase2AgentPrompt(cfg.memDir);
+
+	const env = {
+		...process.env,
+		PI_MEMORY_DIR: cfg.memDir,
+		PI_MEMORY_AUTO: "0",   // child pi must not enqueue new jobs (no loops)
+		PI_MEMORY_RECALL: "0", // no recall injection in the child
+	};
+	const args = ["--print"];
+	if (modelSpec) args.push("--model", modelSpec);
+	args.push(prompt);
+
+	log(`phase2: spawning pi agent (model=${modelSpec})`);
+	const child = spawn("pi", args, { env, stdio: ["ignore", "pipe", "pipe"] });
+	let stdout = "";
+	let stderr = "";
+	let settled = false;
+	const result = await new Promise((resolve) => {
+		const timer = setTimeout(() => {
+			if (!settled) {
+				settled = true;
+				child.kill("SIGKILL");
+				resolve({ ok: false, error: "phase2 agent timed out" });
+			}
+		}, PHASE2_AGENT_TIMEOUT_MS);
+		child.stdout.on("data", (d) => { stdout += d; });
+		child.stderr.on("data", (d) => { stderr += d; });
+		child.on("error", (err) => {
+			if (!settled) { settled = true; clearTimeout(timer); resolve({ ok: false, error: String(err) }); }
+		});
+		child.on("exit", (code) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			const memoryChanged = fs.existsSync(path.join(cfg.memDir, "MEMORY.md")) && fs.existsSync(path.join(cfg.memDir, "memory_summary.md"));
+			if (code === 0 && memoryChanged) resolve({ ok: true, stdout: stdout.slice(-2000) });
+			else resolve({ ok: false, error: `pi exited ${code}: ${stderr.slice(-500) || stdout.slice(-500)}` });
+		});
+	});
+
+	if (result.ok) {
+		log("phase2: consolidation agent finished");
+		markPhase2Completed(row);
+	} else {
+		log("phase2 agent failed:", result.error);
+		markPhase2Failed(row, result.error);
 	}
 }
 
@@ -216,13 +314,19 @@ async function pollOnce() {
 	if (!db || polling) return;
 	polling = true;
 	try {
-		// phase1 first (usually enqueued more often), then phase2
-		for (const kind of ["phase1", "phase2"]) {
-			const jobs = claimJobs(kind);
-			for (const row of jobs) {
-				// run sequentially for simplicity; concurrency via forking more workers
-				await executeJob(row);
-			}
+		// phase 1 jobs
+		for (const row of claimPhase1Jobs()) {
+			try { await runPhase1(row); markCompleted(row); }
+			catch (err) { log(`phase1 ${row.job_key} failed:`, err.message); markFailed(row, err.message); }
+		}
+		// phase 2 singleton
+		let claim = claimPhase2();
+		if (claim.outcome === "recycled") claim = claimPhase2(); // retry after pending reset
+		if (claim.outcome === "claimed") {
+			try { await runPhase2AsAgent(claim.row); }
+			catch (err) { log("phase2 unexpected error:", err.message); markPhase2Failed(claim.row, err.message); }
+		} else if (claim.outcome !== "no_job" && claim.outcome !== "skipped_cooldown" && claim.outcome !== "skipped_running" && claim.outcome !== "skipped_retry_backoff") {
+			log("phase2 claim:", claim.outcome);
 		}
 	} catch (err) {
 		log("poll error:", err.message);
@@ -233,10 +337,7 @@ async function pollOnce() {
 
 function startLoop() {
 	const ms = cfg?.pollMs ?? POLL_MS_DEFAULT;
-	setInterval(() => {
-		void pollOnce();
-	}, ms);
-	// immediate first poll
+	setInterval(() => { void pollOnce(); }, ms);
 	void pollOnce();
 }
 
@@ -249,23 +350,16 @@ process.on("message", (msg) => {
 		log(`configured: db=${cfg.dbPath} model=${cfg.llm?.model} poll=${cfg?.pollMs ?? POLL_MS_DEFAULT}ms`);
 		startLoop();
 	} else if (msg.type === "shutdown") {
-		running = false;
 		log("shutting down");
 		process.exit(0);
 	}
 });
 
-// parent died without IPC shutdown: exit too
 process.on("disconnect", () => {
-	if (running) {
-		log("parent disconnected; exiting");
-		process.exit(0);
-	}
+	log("parent disconnected; exiting");
+	process.exit(0);
 });
 
 setTimeout(() => {
-	if (!cfg) {
-		log("no config received within 10s; exiting");
-		process.exit(1);
-	}
+	if (!cfg) { log("no config received within 10s; exiting"); process.exit(1); }
 }, 10_000);
