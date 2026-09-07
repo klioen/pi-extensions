@@ -367,22 +367,17 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.registerCommand("goal", {
 		description:
-			"pi-loop: /goal (status) | /goal set <objective> [budget] | /goal pause | /goal resume | /goal complete | /goal clear",
+			"pi-loop: /goal [<objective>|clear|edit|pause|resume] (Codex usage)",
 		handler: async (args, ctx) => {
 			const parts = (args || "").trim().split(/\s+/);
 			const sub = (parts[0] || "").toLowerCase();
-			if (sub === "set") {
-				const objective = (args || "").slice(parts[0].length).trim();
-				if (!objective) {
-					ctx.ui.notify("pi-loop: usage — /goal set <objective> [token_budget]", "warning");
-					return;
-				}
-				const m = objective.match(/^(.*?)\s+(\d+)\s*$/);
-				const text = m ? m[1] : objective;
-				const budget = m ? Number(m[2]) : DEFAULT_BUDGET;
+			// Codex usage: /goal <objective> sets the goal directly. A trailing
+			// number on the objective is treated as an explicit token budget
+			// (pi extension; codex sets budgets via tool/config only).
+			const setGoal = (objective: string, budget: number | null) => {
 				goal = {
 					threadId: "session",
-					objective: text.slice(0, 2000),
+					objective: objective.slice(0, 2000),
 					status: "active",
 					tokenBudget: budget,
 					tokensUsed: 0,
@@ -392,12 +387,24 @@ export default function (pi: ExtensionAPI) {
 					createdAt: Date.now(),
 					updatedAt: Date.now(),
 				};
-				saveGoal(goal); // run one turn, then stop for the user (codex deferral)
+				// deferred: run one turn, then stop for the user (codex deferral)
 				saveGoal(goal);
 				ctx.ui.notify(`pi-loop: goal set — ${goal.objective} (active, ${budget ?? "no"} token budget)`, "info");
 				// kick off the first turn toward the goal immediately (codex
 				// continue_if_idle after setting a goal), silently
 				kickoffTurn(pi);
+			};
+			if (sub === "set" || sub === "edit") {
+				// pi compat: /goal set <objective>; codex uses /goal edit
+				const objective = (args || "").slice(parts[0].length).trim();
+				if (!objective) {
+					ctx.ui.notify("pi-loop: usage — /goal <objective> [token_budget]", "warning");
+					return;
+				}
+				const m = objective.match(/^(.*?)\s+(\d+)\s*$/);
+				const text = m ? m[1] : objective;
+				const budget = m ? Number(m[2]) : DEFAULT_BUDGET;
+				setGoal(text, budget);
 				return;
 			}
 			if (sub === "pause") {
@@ -421,16 +428,6 @@ export default function (pi: ExtensionAPI) {
 				} else ctx.ui.notify("pi-loop: no goal to resume", "warning");
 				return;
 			}
-			if (sub === "complete") {
-				if (goal.objective) {
-					goal.status = "complete";
-					goal.deferred = true;
-					goal.updatedAt = Date.now();
-					saveGoal(goal);
-					ctx.ui.notify("pi-loop: goal marked complete", "info");
-				} else ctx.ui.notify("pi-loop: no goal", "warning");
-				return;
-			}
 			if (sub === "clear") {
 				goal = emptyGoal();
 				goal.deferred = true;
@@ -438,21 +435,30 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("pi-loop: goal cleared", "info");
 				return;
 			}
-			// default: status
-			if (!goal.objective) {
-				ctx.ui.notify("pi-loop: no goal. Usage: /goal set <objective> [token_budget]", "info");
+			// No argument: show the current goal summary (codex /goal with no args).
+			if (!sub) {
+				if (!goal.objective) {
+					ctx.ui.notify("pi-loop: no goal. Usage: /goal <objective> [token_budget]", "info");
+					return;
+				}
+				ctx.ui.notify(
+					[
+						`pi-loop goal (${statusLabel(goal.status)})`,
+						`objective: ${goal.objective}`,
+						`progress: ${goal.turns} turns, ${goal.tokensUsed} tokens${goal.tokenBudget !== null ? ` / ${goal.tokenBudget} budget` : ""}`,
+						`created: ${new Date(goal.createdAt).toISOString()}`,
+						`max turns: ${MAX_TURNS}`,
+					].join("\n"),
+					"info",
+				);
 				return;
 			}
-			ctx.ui.notify(
-				[
-					`pi-loop goal (${statusLabel(goal.status)})`,
-					`objective: ${goal.objective}`,
-					`progress: ${goal.turns} turns, ${goal.tokensUsed} tokens${goal.tokenBudget !== null ? ` / ${goal.tokenBudget} budget` : ""}`,
-					`created: ${new Date(goal.createdAt).toISOString()}`,
-					`max turns: ${MAX_TURNS}`,
-				].join("\n"),
-				"info",
-			);
+			// Anything else is the objective: /goal improve benchmark coverage
+			// (Codex usage). Trailing number = explicit token budget.
+			const m = (args || "").trim().match(/^(.*?)\s+(\d+)\s*$/);
+			const text = m ? m[1] : (args || "").trim();
+			const budget = m ? Number(m[2]) : DEFAULT_BUDGET;
+			setGoal(text, budget);
 		},
 	});
 }
