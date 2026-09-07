@@ -133,8 +133,8 @@ function continuationMessage(g: Goal): string {
 		`## Goal continuation (pi-loop)`,
 		``,
 		`Keep working toward the active goal below. You are the agent in a loop; continue making progress autonomously.`,
-		`When the goal is achieved, call the goal tool with action "update", status "complete", and a short summary.`,
-		`If you are blocked and need the user, set status "blocked" instead of looping.`,
+		`When the goal is achieved, call the update_goal tool with status "complete".`,
+		`If you are blocked and need the user, call update_goal with status "blocked" instead of looping.`,
 		``,
 		`<goal objective="${g.objective}">`,
 		`<progress>${budget}</progress>`,
@@ -330,6 +330,9 @@ export default function (pi: ExtensionAPI) {
 				};
 				saveGoal(goal);
 				ctx.ui.notify(`pi-loop: goal set — ${goal.objective} (active, ${budget ?? "no"} token budget)`, "info");
+				// kick off the first turn toward the goal immediately (codex
+				// continue_if_idle after setting a goal)
+				pi.sendUserMessage(continuationMessage(goal), { deliverAs: "steer" });
 				return;
 			}
 			if (sub === "pause") {
@@ -347,6 +350,7 @@ export default function (pi: ExtensionAPI) {
 					goal.updatedAt = Date.now();
 					saveGoal(goal);
 					ctx.ui.notify(`pi-loop: goal resumed — ${goal.objective}`, "info");
+					pi.sendUserMessage(continuationMessage(goal), { deliverAs: "steer" });
 				} else ctx.ui.notify("pi-loop: no goal to resume", "warning");
 				return;
 			}
