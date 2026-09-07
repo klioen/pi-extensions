@@ -53,6 +53,8 @@ interface Goal {
 	tokenBudget: number | null;
 	tokensUsed: number;
 	turns: number;
+	/** consecutive goal turns in which the agent reported blocked (codex blocked audit) */
+	blockedConsecutive: number;
 	createdAt: number;
 	updatedAt: number;
 }
@@ -65,6 +67,7 @@ function emptyGoal(): Goal {
 		tokenBudget: null,
 		tokensUsed: 0,
 		turns: 0,
+		blockedConsecutive: 0,
 		createdAt: Date.now(),
 		updatedAt: Date.now(),
 	};
@@ -205,70 +208,100 @@ export default function (pi: ExtensionAPI) {
 	// ------------------------------------------------------------------
 	// goal tool (codex create_goal / update_goal / get_goal)
 	// ------------------------------------------------------------------
+	// ------------------------------------------------------------------
+	// goal tools (codex create_goal / update_goal / get_goal)
+	// ------------------------------------------------------------------
 	pi.registerTool({
-		name: "goal",
-		label: "Goal",
+		name: "create_goal",
+		label: "Create Goal",
 		description:
-			"Manage a persistent goal for this conversation (Codex-style). " +
-			'actions: "create" (set a new objective), "update" (change objective/status/progress), "get" (read current goal). ' +
-			"status: active (keep working, loop continues), complete (done), paused, blocked (need user), " +
-			"budget_limited, usage_limited. When the goal is achieved, update it to complete — that stops the loop.",
+			"Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. " +
+			"Set token_budget only when an explicit token budget is requested. Fails if an unfinished goal exists; use update_goal only for status.",
 		promptSnippet:
-			"For long-running or multi-step tasks, create a goal with the goal tool; update it as you progress and set it complete when done.",
+			"Only create a goal when the user or system explicitly asks for one (e.g. a long-running objective); otherwise just do the task.",
 		parameters: Type.Object({
-			action: Type.Union([Type.Literal("create"), Type.Literal("update"), Type.Literal("get")]),
-			objective: Type.Optional(Type.String({ description: "The goal objective (<= 2000 chars)." })),
-			status: Type.Optional(
-				Type.Union([
-					Type.Literal("active"),
-					Type.Literal("complete"),
-					Type.Literal("paused"),
-					Type.Literal("blocked"),
-				]),
-			),
-			token_budget: Type.Optional(Type.Integer({ description: "Optional token budget for the goal." })),
-			summary: Type.Optional(Type.String({ description: "Optional completion/update summary." })),
+			objective: Type.String({ description: "Required. The concrete objective to start pursuing. Starts a new active goal when none exists or replaces a completed one." }),
+			token_budget: Type.Optional(Type.Integer({ description: "Positive token budget for the new goal. Omit unless explicitly requested." })),
 		}),
 		async execute(_id, params) {
-			const now = Date.now();
-			if (params.action === "create") {
-				if (!params.objective?.trim()) return textResult("goal: objective is required for create", true);
-				goal = {
-					threadId: goal.threadId || "session",
-					objective: params.objective.trim().slice(0, 2000),
-					status: params.status ?? "active",
-					tokenBudget: params.token_budget ?? null,
-					tokensUsed: 0,
-					turns: 0,
-					createdAt: now,
-					updatedAt: now,
-				};
-				saveGoal(goal);
-				return textResult(`goal created: ${goal.objective} (${statusLabel(goal.status)})`);
+			if (!params.objective?.trim()) return textResult("create_goal: objective is required", true);
+			if (goal.status === "active") {
+				return textResult(`create_goal: an unfinished goal already exists — ${goal.objective}. Use get_goal / update_goal instead.`, true);
 			}
-			if (params.action === "update") {
-				if (params.objective) goal.objective = params.objective.trim().slice(0, 2000);
-				if (params.status) goal.status = params.status;
-				if (params.token_budget !== undefined) goal.tokenBudget = params.token_budget;
-				goal.updatedAt = now;
-				if (goal.status === "complete" && params.summary) {
-					// fold summary into objective history for the final recall
-					goal.objective = `${goal.objective} — [complete] ${params.summary}`.slice(0, 2000);
-				}
-				saveGoal(goal);
-				return textResult(`goal updated: ${statusLabel(goal.status)} — ${goal.objective}`);
-			}
-			// get
-			if (goal.status === "complete" && !goal.objective) return textResult("no active goal");
-			return textResult(
-				`goal: ${statusLabel(goal.status)}\nobjective: ${goal.objective}\nprogress: ${goal.turns} turns, ${goal.tokensUsed} tokens${goal.tokenBudget !== null ? ` / ${goal.tokenBudget} budget` : ""}\ncreated: ${new Date(goal.createdAt).toISOString()}`,
-			);
+			goal = {
+				threadId: "session",
+				objective: params.objective.trim().slice(0, 2000),
+				status: "active",
+				tokenBudget: params.token_budget ?? null,
+				tokensUsed: 0,
+				turns: 0,
+				blockedConsecutive: 0,
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+			};
+			saveGoal(goal);
+			return textResult(`goal created: ${goal.objective} (active${goal.tokenBudget !== null ? `, budget ${goal.tokenBudget}` : ""})`);
 		},
 	});
 
-	// ------------------------------------------------------------------
-	// /goal command
-	// ------------------------------------------------------------------
+	pi.registerTool({
+		name: "update_goal",
+		label: "Update Goal",
+		description:
+			"Update the existing goal. Use this tool only to mark the goal achieved (complete) or genuinely blocked. " +
+			"Set status to complete only when the objective has actually been achieved and no required work remains. " +
+			"Set status to blocked only when the same blocking condition has repeated for at least three consecutive goal turns and you cannot make progress without user input or an external-state change. " +
+			"Once the blocked threshold is satisfied, do not keep reporting while leaving the goal active. " +
+			"Do not use blocked merely because the work is hard, slow, uncertain, or would benefit from clarification. " +
+			"You cannot pause, resume, budget-limit, or usage-limit a goal; those are user/system controlled. " +
+			"When marking a budgeted goal complete, report the final token usage from the tool result to the user.",
+		promptSnippet:
+			"Update a goal to complete only when its objective is truly achieved, or to blocked after 3 consecutive turns stuck on the same obstacle.",
+		parameters: Type.Object({
+			status: Type.Union([Type.Literal("complete"), Type.Literal("blocked")]),
+		}),
+		async execute(_id, params) {
+			if (!goal.objective) return textResult("update_goal: no goal exists — use create_goal first", true);
+			if (goal.status !== "active") {
+				return textResult(`update_goal: goal is ${statusLabel(goal.status)}; only active goals can be updated`, true);
+			}
+			if (params.status === "complete") {
+				goal.status = "complete";
+				goal.blockedConsecutive = 0;
+				goal.updatedAt = Date.now();
+				saveGoal(goal);
+				return textResult(`goal complete: ${goal.objective} (${goal.turns} turns, ${goal.tokensUsed} tokens used)`);
+			}
+			// blocked: require 3 consecutive turns stuck on the same condition
+			goal.blockedConsecutive += 1;
+			goal.updatedAt = Date.now();
+			saveGoal(goal);
+			if (goal.blockedConsecutive < 3) {
+				return textResult(
+					`blocked reported (${goal.blockedConsecutive}/3 consecutive). Keep trying; only set blocked after 3 consecutive goal turns on the same obstacle.`,
+				);
+			}
+			goal.status = "blocked";
+			saveGoal(goal);
+			return textResult(`goal blocked: ${goal.objective} (after ${goal.blockedConsecutive} consecutive turns)`);
+		},
+	});
+
+	pi.registerTool({
+		name: "get_goal",
+		label: "Get Goal",
+		description:
+			"Get the current goal for this thread, including status, budgets, token usage, and remaining token budget.",
+		promptSnippet: "Check the current goal with get_goal before deciding whether to keep working.",
+		parameters: Type.Object({}),
+		async execute() {
+			if (!goal.objective) return textResult("no goal");
+			const remaining = goal.tokenBudget !== null ? Math.max(0, goal.tokenBudget - goal.tokensUsed) : null;
+			return textResult(
+				`goal: ${statusLabel(goal.status)}\nobjective: ${goal.objective}\nprogress: ${goal.turns} turns, ${goal.tokensUsed} tokens${goal.tokenBudget !== null ? ` / ${goal.tokenBudget} budget (${remaining} remaining)` : ""}\ncreated: ${new Date(goal.createdAt).toISOString()}`,
+			);
+		},
+	});
 	pi.registerCommand("goal", {
 		description:
 			"pi-loop: /goal (status) | /goal set <objective> [budget] | /goal pause | /goal resume | /goal complete | /goal clear",
@@ -291,6 +324,7 @@ export default function (pi: ExtensionAPI) {
 					tokenBudget: budget,
 					tokensUsed: 0,
 					turns: 0,
+					blockedConsecutive: 0,
 					createdAt: Date.now(),
 					updatedAt: Date.now(),
 				};
