@@ -104,13 +104,24 @@ function statusLabel(s: GoalStatus): string {
 // Token accounting (agent_end usage)
 // ---------------------------------------------------------------------------
 
-function extractTokenUsage(event: { messages: Array<{ usage?: { totalTokens?: number } }> }): number {
+/**
+ * Sum the per-request token cost of this run's messages.
+ *
+ * IMPORTANT: usage.totalTokens is a cumulative, monotonically increasing
+ * figure (context keeps growing across turns), while input/output are the
+ * per-request deltas. Summing totalTokens across messages double-counts all
+ * earlier history and blows up the goal's token accounting. Use input+output.
+ */
+function extractTokenUsage(event: { messages: Array<{ usage?: { input?: number; output?: number } }> }): number {
 	let total = 0;
 	for (const m of event.messages) {
-		total += m.usage?.totalTokens ?? 0;
+		const u = m.usage;
+		if (u) total += (u.input ?? 0) + (u.output ?? 0);
 	}
 	return total;
 }
+
+/** Apply budget/limits after accounting; returns the new status. */
 
 /** Apply budget/limits after accounting; returns the new status. */
 function enforceLimits(g: Goal): GoalStatus {
