@@ -195,4 +195,4 @@ async function completeLLM(config, prompt, signal) {
 	return text.trim();
 }
 
-module.exports = { SCHEMA, phase1Prompt, completeLLM, parseJsonObj };
+module.exports = { SCHEMA, phase1Prompt, completeLLM, parseJsonObj, repairJsonText };

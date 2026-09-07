@@ -26,6 +26,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { DatabaseSync } from "node:sqlite";
+import goalCore from "../lib/goal-core.cjs";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -183,63 +184,9 @@ function getSessionId(ctx: ExtensionContext): string {
 	return ctx.sessionManager.getSessionId();
 }
 
-/**
- * Sum the per-request token cost of this run's messages.
- * IMPORTANT: usage.totalTokens is cumulative across turns; input/output are
- * per-request deltas. Summing totalTokens double-counts history.
- */
-function extractTokenUsage(event: { messages: Array<{ usage?: { input?: number; output?: number } }> }): number {
-	let total = 0;
-	for (const m of event.messages) {
-		const u = m.usage;
-		if (u) total += (u.input ?? 0) + (u.output ?? 0);
-	}
-	return total;
-}
 
-/** Apply budget/limits after accounting; returns the new status. */
-function enforceLimits(g: Goal): GoalStatus {
-	if (g.status !== "active") return g.status;
-	if (g.tokenBudget !== null && g.tokensUsed >= g.tokenBudget) {
-		g.status = "budget_limited";
-	} else if (g.turns >= MAX_TURNS) {
-		g.status = "usage_limited"; // usage guardrail (codex UsageLimited)
-	}
-	return g.status;
-}
 
-function statusLabel(s: GoalStatus): string {
-	return s.replace("_", " ").toUpperCase();
-}
 
-// ---------------------------------------------------------------------------
-// Steering (codex continuation_prompt)
-// ---------------------------------------------------------------------------
-
-function continuationMessage(g: Goal): string {
-	const budget = g.tokenBudget !== null ? `${g.turns} turns / ${g.tokensUsed}/${g.tokenBudget} tokens` : `${g.turns} turns / ${g.tokensUsed} tokens`;
-	const time = g.timeUsedSeconds > 0 ? `, ${formatSeconds(g.timeUsedSeconds)} elapsed` : "";
-	return [
-		`## Goal continuation (pi-loop)`,
-		``,
-		`Keep working toward the active goal below. You are the agent in a loop; continue making progress autonomously.`,
-		`When the goal is achieved, call the update_goal tool with status "complete".`,
-		`If you are blocked and need the user, call update_goal with status "blocked" instead of looping.`,
-		``,
-		`<goal objective="${g.objective}">`,
-		`<progress>${budget}${time}</progress>`,
-		`</goal>`,
-		``,
-	].join("\n");
-}
-
-function formatSeconds(seconds: number): string {
-	if (seconds < 60) return `${seconds}s`;
-	const minutes = Math.floor(seconds / 60);
-	if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
-	const hours = Math.floor(minutes / 60);
-	return `${hours}h ${minutes % 60}m`;
-}
 
 /**
  * Silently kick off a new turn toward the active goal of `sessionId`.
@@ -253,7 +200,7 @@ function kickoffTurn(pi: ExtensionAPI, sessionId: string): void {
 	pi.sendMessage(
 		{
 			customType: "pi-loop-continue",
-			content: continuationMessage(g),
+			content: goalCore.continuationMessage(g),
 			display: false,
 		},
 		{ triggerTurn: true, deliverAs: "steer" },
@@ -288,7 +235,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				message: {
 					customType: "pi-loop-steering",
-					content: continuationMessage(g),
+					content: goalCore.continuationMessage(g),
 					display: false,
 				},
 			};
@@ -303,17 +250,17 @@ export default function (pi: ExtensionAPI) {
 			const sid = getSessionId(ctx);
 			const g = loadGoal(sid);
 			if (!g || g.status !== "active") return;
-			g.tokensUsed += extractTokenUsage(event as never);
+			g.tokensUsed += goalCore.extractTokenUsage(event as never);
 			const start = turnStarts.get(sid);
 			if (start !== undefined) {
 				g.timeUsedSeconds += Math.max(0, Math.round((Date.now() - start) / 1000));
 				turnStarts.delete(sid);
 			}
-			enforceLimits(g);
+			goalCore.enforceLimits(g);
 			g.updatedAt = Date.now();
 			saveGoal(g);
 			if (g.status !== "active") {
-				ctx.ui.notify(`pi-loop: goal ${statusLabel(g.status)} (${g.turns} turns, ${g.tokensUsed} tokens)`, "info");
+				ctx.ui.notify(`pi-loop: goal ${goalCore.statusLabel(g.status)} (${g.turns} turns, ${g.tokensUsed} tokens)`, "info");
 			}
 		} catch {
 			/* never break */
@@ -336,7 +283,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			g.turns += 1;
-			enforceLimits(g);
+			goalCore.enforceLimits(g);
 			g.updatedAt = Date.now();
 			saveGoal(g);
 			if (g.status !== "active") return;
@@ -408,7 +355,7 @@ export default function (pi: ExtensionAPI) {
 			const g = loadGoal(sid);
 			if (!g) return textResult("update_goal: no goal exists — use create_goal first", true);
 			if (g.status !== "active") {
-				return textResult(`update_goal: goal is ${statusLabel(g.status)}; only active goals can be updated`, true);
+				return textResult(`update_goal: goal is ${goalCore.statusLabel(g.status)}; only active goals can be updated`, true);
 			}
 			if (params.status === "complete") {
 				g.status = "complete";
@@ -416,7 +363,7 @@ export default function (pi: ExtensionAPI) {
 				g.updatedAt = Date.now();
 				saveGoal(g);
 				setDeferral(sid);
-				return textResult(`goal complete: ${g.objective} (${g.turns} turns, ${g.tokensUsed} tokens used, ${formatSeconds(g.timeUsedSeconds)})`);
+				return textResult(`goal complete: ${g.objective} (${g.turns} turns, ${g.tokensUsed} tokens used, ${goalCore.formatSeconds(g.timeUsedSeconds)})`);
 			}
 			// blocked: require 3 consecutive turns stuck on the same condition
 			g.blockedConsecutive += 1;
@@ -446,7 +393,7 @@ export default function (pi: ExtensionAPI) {
 			if (!g) return textResult("no goal");
 			const remaining = g.tokenBudget !== null ? Math.max(0, g.tokenBudget - g.tokensUsed) : null;
 			return textResult(
-				`goal: ${statusLabel(g.status)}\nobjective: ${g.objective}\nprogress: ${g.turns} turns, ${g.tokensUsed} tokens${g.tokenBudget !== null ? ` / ${g.tokenBudget} budget (${remaining} remaining)` : ""}${g.timeUsedSeconds > 0 ? `, ${formatSeconds(g.timeUsedSeconds)} elapsed` : ""}\ncreated: ${new Date(g.createdAt).toISOString()}`,
+				`goal: ${goalCore.statusLabel(g.status)}\nobjective: ${g.objective}\nprogress: ${g.turns} turns, ${g.tokensUsed} tokens${g.tokenBudget !== null ? ` / ${g.tokenBudget} budget (${remaining} remaining)` : ""}${g.timeUsedSeconds > 0 ? `, ${goalCore.formatSeconds(g.timeUsedSeconds)} elapsed` : ""}\ncreated: ${new Date(g.createdAt).toISOString()}`,
 			);
 		},
 	});
@@ -532,9 +479,9 @@ export default function (pi: ExtensionAPI) {
 				}
 				ctx.ui.notify(
 					[
-						`pi-loop goal (${statusLabel(g.status)})`,
+						`pi-loop goal (${goalCore.statusLabel(g.status)})`,
 						`objective: ${g.objective}`,
-						`progress: ${g.turns} turns, ${g.tokensUsed} tokens${g.tokenBudget !== null ? ` / ${g.tokenBudget} budget` : ""}${g.timeUsedSeconds > 0 ? `, ${formatSeconds(g.timeUsedSeconds)} elapsed` : ""}`,
+						`progress: ${g.turns} turns, ${g.tokensUsed} tokens${g.tokenBudget !== null ? ` / ${g.tokenBudget} budget` : ""}${g.timeUsedSeconds > 0 ? `, ${goalCore.formatSeconds(g.timeUsedSeconds)} elapsed` : ""}`,
 						`created: ${new Date(g.createdAt).toISOString()}`,
 						`max turns: ${MAX_TURNS}`,
 					].join("\n"),
