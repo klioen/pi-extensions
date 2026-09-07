@@ -62,6 +62,14 @@ interface Goal {
 	turns: number;
 	/** consecutive goal turns in which the agent reported blocked (codex blocked audit) */
 	blockedConsecutive: number;
+	/**
+	 * Deferral marker (codex thread_goal_continuation_deferrals): set whenever
+	 * the goal is written (create/update/command). While set, agent_settled
+	 * skips auto-continuation once so the user sees the result of the turn
+	 * that wrote the goal; the next user-initiated turn clears it (codex
+	 * on_turn_start clears the deferral), after which the loop resumes.
+	 */
+	deferred: boolean;
 	createdAt: number;
 	updatedAt: number;
 }
@@ -75,6 +83,7 @@ function emptyGoal(): Goal {
 		tokensUsed: 0,
 		turns: 0,
 		blockedConsecutive: 0,
+		deferred: false,
 		createdAt: Date.now(),
 		updatedAt: Date.now(),
 	};
@@ -189,6 +198,11 @@ export default function (pi: ExtensionAPI) {
 	// (codex on_turn_start / inject_active_turn_steering)
 	pi.on("before_agent_start", async () => {
 		try {
+			// codex on_turn_start: clear the continuation deferral on each new turn
+			if (goal.deferred) {
+				goal.deferred = false;
+				saveGoal(goal);
+			}
 			if (goal.status !== "active") return;
 			return {
 				message: {
@@ -221,6 +235,16 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", async (_event, ctx) => {
 		try {
 			if (goal.status !== "active") return;
+			// codex continue_if_idle: a goal that was just written (created or
+			// updated) defers continuation once — stop and let the user see the
+			// result. Cleared on the next user-initiated turn.
+			if (goal.deferred) {
+				goal.deferred = false;
+				goal.updatedAt = Date.now();
+				saveGoal(goal);
+				debug("deferring continuation until next user message");
+				return;
+			}
 			// print/CI mode exits after one run, so a queued continuation never
 			// executes — only auto-loop in resident modes (TUI/RPC).
 			if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
@@ -271,9 +295,11 @@ export default function (pi: ExtensionAPI) {
 				tokensUsed: 0,
 				turns: 0,
 				blockedConsecutive: 0,
+				deferred: true,
 				createdAt: Date.now(),
 				updatedAt: Date.now(),
 			};
+			saveGoal(goal); // pause auto-continuation until the user's next message
 			saveGoal(goal);
 			return textResult(`goal created: ${goal.objective} (active${goal.tokenBudget !== null ? `, budget ${goal.tokenBudget}` : ""})`);
 		},
@@ -303,6 +329,7 @@ export default function (pi: ExtensionAPI) {
 			if (params.status === "complete") {
 				goal.status = "complete";
 				goal.blockedConsecutive = 0;
+				goal.deferred = true;
 				goal.updatedAt = Date.now();
 				saveGoal(goal);
 				return textResult(`goal complete: ${goal.objective} (${goal.turns} turns, ${goal.tokensUsed} tokens used)`);
@@ -317,6 +344,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 			goal.status = "blocked";
+			goal.deferred = true;
 			saveGoal(goal);
 			return textResult(`goal blocked: ${goal.objective} (after ${goal.blockedConsecutive} consecutive turns)`);
 		},
@@ -360,9 +388,11 @@ export default function (pi: ExtensionAPI) {
 					tokensUsed: 0,
 					turns: 0,
 					blockedConsecutive: 0,
+					deferred: true,
 					createdAt: Date.now(),
 					updatedAt: Date.now(),
 				};
+				saveGoal(goal); // run one turn, then stop for the user (codex deferral)
 				saveGoal(goal);
 				ctx.ui.notify(`pi-loop: goal set — ${goal.objective} (active, ${budget ?? "no"} token budget)`, "info");
 				// kick off the first turn toward the goal immediately (codex
@@ -373,6 +403,7 @@ export default function (pi: ExtensionAPI) {
 			if (sub === "pause") {
 				if (goal.status !== "complete" && goal.objective) {
 					goal.status = "paused";
+					goal.deferred = true;
 					goal.updatedAt = Date.now();
 					saveGoal(goal);
 					ctx.ui.notify("pi-loop: goal paused", "info");
@@ -382,6 +413,7 @@ export default function (pi: ExtensionAPI) {
 			if (sub === "resume") {
 				if (goal.objective) {
 					goal.status = "active";
+					goal.deferred = true; // one turn, then wait for the user
 					goal.updatedAt = Date.now();
 					saveGoal(goal);
 					ctx.ui.notify(`pi-loop: goal resumed — ${goal.objective}`, "info");
@@ -392,6 +424,7 @@ export default function (pi: ExtensionAPI) {
 			if (sub === "complete") {
 				if (goal.objective) {
 					goal.status = "complete";
+					goal.deferred = true;
 					goal.updatedAt = Date.now();
 					saveGoal(goal);
 					ctx.ui.notify("pi-loop: goal marked complete", "info");
@@ -400,6 +433,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (sub === "clear") {
 				goal = emptyGoal();
+				goal.deferred = true;
 				saveGoal(goal);
 				ctx.ui.notify("pi-loop: goal cleared", "info");
 				return;
