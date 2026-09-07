@@ -43,7 +43,7 @@ import { fileURLToPath } from "node:url";
 // ---------------------------------------------------------------------------
 
 const MEMORY_DIR = (process.env.PI_MEMORY_DIR || path.join(os.homedir(), ".pi", "agent", "memories")).replace(/\/+$/, "");
-const DB_PATH = path.join(MEMORY_DIR, "memory.db");
+const DB_PATH = process.env.PI_MEMORY_DB || path.join(os.homedir(), ".pi", "agent", "sqlite", "memory.db");
 const RECALL_ENABLED = process.env.PI_MEMORY_RECALL !== "0";
 const AUTO_ENQUEUE = process.env.PI_MEMORY_AUTO !== "0";
 const SUMMARY_TOKEN_LIMIT = Math.max(500, Number(process.env.PI_MEMORY_SUMMARY_TOKENS) || 4000);

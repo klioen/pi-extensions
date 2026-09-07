@@ -34,7 +34,7 @@ import * as path from "node:path";
 // Config
 // ---------------------------------------------------------------------------
 
-const DB_PATH = process.env.PI_LOOP_DB || path.join(os.homedir(), ".pi", "agent", "goal.db");
+const DB_PATH = process.env.PI_LOOP_DB || path.join(os.homedir(), ".pi", "agent", "sqlite", "goal.db");
 const MAX_TURNS = Math.max(1, Number(process.env.PI_LOOP_MAX_TURNS) || 20);
 /**
  * Default token budget when the user/agent does not specify one. Mirrors
