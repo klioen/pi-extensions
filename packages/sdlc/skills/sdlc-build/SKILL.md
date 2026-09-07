@@ -1,6 +1,10 @@
 ---
 name: sdlc-build
-description: Implement code the right way. Use whenever the user asks to implement something, write code, change code, fix code, add a feature, or start development work. Mandates: read-only reconnaissance first, a written plan.md approved before any edit, AGENTS.md as the project-memory file (never CLAUDE.md), and guardrails that run as code. Distilled from Anthropic's AI-native SDLC playbook, adapted for pi.
+description: >-
+  Implement code the right way. Use whenever the user asks to implement something, write code, change
+  code, fix code, add a feature, or start development work. Mandates: read-only reconnaissance first,
+  a written plan.md approved before any edit, AGENTS.md as the project-memory file (never CLAUDE.md),
+  and guardrails that run as code. Distilled from Anthropic's AI-native SDLC playbook, adapted for pi.
 ---
 
 # sdlc-build — 实现（代码开发规范）

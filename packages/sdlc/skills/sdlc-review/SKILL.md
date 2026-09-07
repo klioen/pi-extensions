@@ -1,6 +1,10 @@
 ---
 name: sdlc-review
-description: Review PRs and code the right way. Use whenever the user asks to review a PR, review code, check a diff, do a code review, or says "review this". Runs three passes (bugs / security / compliance-against-spec), separates Important from nits, and feeds recurring mistakes back into AGENTS.md. Distilled from Anthropic's AI-native SDLC playbook, adapted for pi.
+description: >-
+  Review PRs and code the right way. Use whenever the user asks to review a PR, review code, check a
+  diff, do a code review, or says "review this". Runs three passes (bugs / security /
+  compliance-against-spec), separates Important from nits, and feeds recurring mistakes back into
+  AGENTS.md. Distilled from Anthropic's AI-native SDLC playbook, adapted for pi.
 ---
 
 # sdlc-review — 代码审查（PR review）

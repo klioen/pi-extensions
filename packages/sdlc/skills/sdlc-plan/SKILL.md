@@ -1,6 +1,10 @@
 ---
 name: sdlc-plan
-description: Start a new feature, requirement, idea, or project change the right way. Use whenever the user describes a new idea, requests a feature, files a ticket-style request, or wants to turn a vague ask into an actionable spec. Produces the intent.md → spec.md artifact chain in git (AI-native SDLC, distilled from Anthropic's playbook).
+description: >-
+  Start a new feature, requirement, idea, or project change the right way. Use whenever the user
+  describes a new idea, requests a feature, files a ticket-style request, or wants to turn a vague ask
+  into an actionable spec. Produces the intent.md → spec.md artifact chain in git (AI-native SDLC,
+  distilled from Anthropic's playbook).
 ---
 
 # sdlc-plan — 需求与设计

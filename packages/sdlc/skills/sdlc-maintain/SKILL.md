@@ -1,6 +1,11 @@
 ---
 name: sdlc-maintain
-description: Handle production incidents, alerts, and monitoring anomalies the right way. Use whenever there is an on-call issue, a production bug, an alert, a metric breach, a failed CI run, or any "things broke in production" situation. Runs deterministic detection with tiered autonomy (log → diagnose → act), writes findings back as intent.md to restart the pipeline, and converts each incident into a regression eval. Distilled from Anthropic's AI-native SDLC playbook, adapted for pi.
+description: >-
+  Handle production incidents, alerts, and monitoring anomalies the right way. Use whenever there is
+  an on-call issue, a production bug, an alert, a metric breach, a failed CI run, or any "things broke
+  in production" situation. Runs deterministic detection with tiered autonomy (log → diagnose → act),
+  writes findings back as intent.md to restart the pipeline, and converts each incident into a
+  regression eval. Distilled from Anthropic's AI-native SDLC playbook, adapted for pi.
 ---
 
 # sdlc-maintain — 维护与闭环

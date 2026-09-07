@@ -1,6 +1,12 @@
 ---
 name: sdlc-test
-description: Verify code the right way. Use whenever code needs verification, a bug needs fixing, tests need writing, a build needs running, or the user says "test it / make sure it works / is it done". Mandates a feedback loop (agent checks its own work before the user sees it), red-green for bug fixes (write the failing test first, never edit the test to make it pass), and evals as regression protection for agent configuration. Distilled from Anthropic's AI-native SDLC playbook, adapted for pi.
+description: >-
+  Verify code the right way. Use whenever code needs verification, a bug needs fixing, tests need
+  writing, a build needs running, or the user says "test it / make sure it works / is it done".
+  Mandates a feedback loop (agent checks its own work before the user sees it), red-green for bug
+  fixes (write the failing test first, never edit the test to make it pass), and evals as regression
+  protection for agent configuration. Distilled from Anthropic's AI-native SDLC playbook, adapted for
+  pi.
 ---
 
 # sdlc-test — 验证（反馈回路 + evals）
