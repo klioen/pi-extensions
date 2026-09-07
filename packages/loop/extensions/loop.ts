@@ -33,6 +33,13 @@ import * as path from "node:path";
 
 const GOAL_FILE = process.env.PI_LOOP_FILE || path.join(os.homedir(), ".pi", "agent", "goal.json");
 const MAX_TURNS = Math.max(1, Number(process.env.PI_LOOP_MAX_TURNS) || 20);
+/**
+ * Default token budget when the user/agent does not specify one. Mirrors
+ * Codex's max_goal_token_budget: a goal without an explicit budget still
+ * cannot run forever — without this, an unbudgeted goal keeps auto-looping
+ * until the turn cap, burning tokens silently.
+ */
+const DEFAULT_BUDGET = Math.max(1, Number(process.env.PI_LOOP_MAX_GOAL_TOKEN_BUDGET) || 100000);
 const ENABLED = process.env.PI_LOOP !== "0";
 const DEBUG = process.env.PI_LOOP_DEBUG === "1";
 
@@ -260,7 +267,7 @@ export default function (pi: ExtensionAPI) {
 				threadId: "session",
 				objective: params.objective.trim().slice(0, 2000),
 				status: "active",
-				tokenBudget: params.token_budget ?? null,
+				tokenBudget: params.token_budget ?? DEFAULT_BUDGET,
 				tokensUsed: 0,
 				turns: 0,
 				blockedConsecutive: 0,
@@ -344,7 +351,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				const m = objective.match(/^(.*?)\s+(\d+)\s*$/);
 				const text = m ? m[1] : objective;
-				const budget = m ? Number(m[2]) : null;
+				const budget = m ? Number(m[2]) : DEFAULT_BUDGET;
 				goal = {
 					threadId: "session",
 					objective: text.slice(0, 2000),
