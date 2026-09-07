@@ -143,6 +143,23 @@ function continuationMessage(g: Goal): string {
 	].join("\n");
 }
 
+/**
+ * Silently kick off a new turn toward the active goal. Uses sendMessage with
+ * triggerTurn + display:false so the steering only enters the LLM context and
+ * never shows in the transcript (codex continuation steering item). Turns
+ * started this way bypass before_agent_start, so no duplicate injection.
+ */
+function kickoffTurn(pi: ExtensionAPI): void {
+	pi.sendMessage(
+		{
+			customType: "pi-loop-continue",
+			content: continuationMessage(goal),
+			display: false,
+		},
+		{ triggerTurn: true, deliverAs: "steer" },
+	);
+}
+
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
@@ -199,7 +216,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			// Loop: kick off the next turn toward the goal (codex continue_if_idle)
 			debug("continuing goal", goal.objective.slice(0, 60));
-			pi.sendUserMessage(continuationMessage(goal), { deliverAs: "steer" });
+			kickoffTurn(pi);
 		} catch {
 			/* never break */
 		}
@@ -331,8 +348,8 @@ export default function (pi: ExtensionAPI) {
 				saveGoal(goal);
 				ctx.ui.notify(`pi-loop: goal set — ${goal.objective} (active, ${budget ?? "no"} token budget)`, "info");
 				// kick off the first turn toward the goal immediately (codex
-				// continue_if_idle after setting a goal)
-				pi.sendUserMessage(continuationMessage(goal), { deliverAs: "steer" });
+				// continue_if_idle after setting a goal), silently
+				kickoffTurn(pi);
 				return;
 			}
 			if (sub === "pause") {
@@ -350,7 +367,7 @@ export default function (pi: ExtensionAPI) {
 					goal.updatedAt = Date.now();
 					saveGoal(goal);
 					ctx.ui.notify(`pi-loop: goal resumed — ${goal.objective}`, "info");
-					pi.sendUserMessage(continuationMessage(goal), { deliverAs: "steer" });
+					kickoffTurn(pi);
 				} else ctx.ui.notify("pi-loop: no goal to resume", "warning");
 				return;
 			}
