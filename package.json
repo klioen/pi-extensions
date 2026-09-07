@@ -1,29 +1,30 @@
 {
-	"name": "pi-extensions",
-	"version": "0.1.0",
-	"description": "Custom pi coding agent packages: env (.env loader), web-access, subagents, failover (multi-key), and memory (local markdown memory modeled after Codex).",
-	"type": "module",
-	"keywords": [
-		"pi-package"
-	],
-	"pi": {
-		"extensions": [
-			"./packages/env/extensions",
-			"./packages/web-access/extensions",
-			"./packages/subagents/extensions",
-			"./packages/failover/extensions",
-			"./packages/memory/extensions",
-			"./packages/loop/extensions"
-		]
-	},
-	"peerDependencies": {
-		"@earendil-works/pi-agent-core": "*",
-		"@earendil-works/pi-coding-agent": "*",
-		"@earendil-works/pi-ai": "*",
-		"typebox": "*"
-	},
-	"scripts": {
-		"test": "node --test \"tests/*.test.mjs\"",
-		"evals:list": "ls evals 2>/dev/null || echo '(no evals yet)'"
-	}
+  "name": "pi-extensions",
+  "version": "0.1.0",
+  "description": "Custom pi coding agent packages: env (.env loader), web-access, subagents, failover (multi-key), and memory (local markdown memory modeled after Codex).",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./packages/env/extensions",
+      "./packages/web-access/extensions",
+      "./packages/subagents/extensions",
+      "./packages/failover/extensions",
+      "./packages/memory/extensions",
+      "./packages/loop/extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "test": "node --test \"tests/*.test.mjs\"",
+    "evals:list": "ls evals 2>/dev/null || echo '(no evals yet)'"
+  },
+  "note": "sandbox write-permission test 2026-09-07"
 }
