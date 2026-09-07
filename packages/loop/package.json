@@ -1,0 +1,14 @@
+{
+	"name": "pi-loop",
+	"version": "0.1.0",
+	"description": "Persistent goals for pi, modeled after Codex's /goal: agent-driven goals with a state machine, token budget, and automatic idle continuation (loop).",
+	"type": "module",
+	"keywords": ["pi-package"],
+	"pi": {
+		"extensions": ["./extensions"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	}
+}
