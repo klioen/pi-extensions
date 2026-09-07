@@ -1,28 +1,31 @@
 /**
- * pi-loop: persistent goals for pi, modeled after Codex's /goal system
- * (codex-rs/ext/goal). Lets the agent (and the user via /goal) set a
- * durable objective on the thread; the extension keeps the agent working
- * toward it across turns until it completes or a budget/limit is hit.
+ * pi-loop: persistent per-session goals for pi, modeled after Codex's /goal
+ * system (codex-rs/ext/goal). Storage mirrors codex: a `goals` table keyed
+ * by session id (codex keys by thread id — in pi the session is the unit of
+ * conversation, and each session carries its own goal), plus a
+ * `goal_continuation_deferrals` table for the deferral marker.
  *
  * Codex alignment:
- * - goal state machine: Active / Paused / Blocked / UsageLimited /
- *   BudgetLimited / Complete  (codex ThreadGoalStatus)
- * - goal tools: `goal` with create|update|get actions (codex
- *   create_goal / update_goal / get_goal tools)
- * - steering injection: before each continuation the objective + progress
- *   are injected as a steer message (codex continuation_prompt)
- * - automatic loop: after the agent settles, if the goal is Active the
- *   extension calls pi.sendUserMessage(..., { deliverAs: "steer" }) to start
- *   the next turn (codex continue_if_idle)
- * - token budget: tokens_used is accounted from agent_end usage; exceeding
- *   the budget flips the goal to BudgetLimited and stops the loop
+ * - goal state machine: active / paused / blocked / usage_limited /
+ *   budget_limited / complete  (codex ThreadGoalStatus)
+ * - tools: create_goal / update_goal / get_goal (codex tool names)
+ * - steering: continuation message injected each turn (display:false,
+ *   LLM-context only — codex continuation steering item)
+ * - automatic loop: after the agent settles, if the goal is active the
+ *   extension silently starts the next turn (codex continue_if_idle)
+ * - token budget: tokens_used accounted from agent_end per-request deltas;
+ *   exceeding the budget flips the goal to budget_limited
+ * - time audit: time_used_seconds accumulated per turn (codex field)
+ * - deferral: writing a goal defers auto-continuation once; the next
+ *   user-initiated turn clears it (codex thread_goal_continuation_deferrals)
  *
- * Storage: ~/.pi/agent/goal.json (cross-session). Guardrails against
- * infinite loops: PI_LOOP_MAX_TURNS (default 20) per goal, plus the budget.
+ * Guardrails: PI_LOOP_MAX_TURNS (default 20) → usage_limited;
+ * unbudgeted goals default to PI_LOOP_MAX_GOAL_TOKEN_BUDGET (100000).
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { DatabaseSync } from "node:sqlite";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -31,13 +34,12 @@ import * as path from "node:path";
 // Config
 // ---------------------------------------------------------------------------
 
-const GOAL_FILE = process.env.PI_LOOP_FILE || path.join(os.homedir(), ".pi", "agent", "goal.json");
+const DB_PATH = process.env.PI_LOOP_DB || path.join(os.homedir(), ".pi", "agent", "goal.db");
 const MAX_TURNS = Math.max(1, Number(process.env.PI_LOOP_MAX_TURNS) || 20);
 /**
  * Default token budget when the user/agent does not specify one. Mirrors
  * Codex's max_goal_token_budget: a goal without an explicit budget still
- * cannot run forever — without this, an unbudgeted goal keeps auto-looping
- * until the turn cap, burning tokens silently.
+ * cannot run forever.
  */
 const DEFAULT_BUDGET = Math.max(1, Number(process.env.PI_LOOP_MAX_GOAL_TOKEN_BUDGET) || 100000);
 const ENABLED = process.env.PI_LOOP !== "0";
@@ -48,85 +50,143 @@ function debug(...args: unknown[]): void {
 }
 
 // ---------------------------------------------------------------------------
+// Schema (mirrors codex state/goals_migrations + thread_goal_continuation_deferrals)
+// ---------------------------------------------------------------------------
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS goals (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    objective TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'active','paused','blocked','usage_limited','budget_limited','complete'
+    )),
+    token_budget INTEGER,
+    tokens_used INTEGER NOT NULL DEFAULT 0,
+    turns INTEGER NOT NULL DEFAULT 0,
+    blocked_consecutive INTEGER NOT NULL DEFAULT 0,
+    time_used_seconds INTEGER NOT NULL DEFAULT 0,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS goal_continuation_deferrals (
+    session_id TEXT PRIMARY KEY NOT NULL REFERENCES goals(session_id) ON DELETE CASCADE
+);
+`;
+
+let db: DatabaseSync | null = null;
+function getDb(): DatabaseSync {
+	if (!db) {
+		db = new DatabaseSync(DB_PATH);
+		db.exec(SCHEMA);
+	}
+	return db;
+}
+
+// ---------------------------------------------------------------------------
 // Goal model (codex ThreadGoal + ThreadGoalStatus)
 // ---------------------------------------------------------------------------
 
 type GoalStatus = "active" | "paused" | "blocked" | "usage_limited" | "budget_limited" | "complete";
 
 interface Goal {
-	threadId: string;
+	sessionId: string;
 	objective: string;
 	status: GoalStatus;
 	tokenBudget: number | null;
 	tokensUsed: number;
 	turns: number;
-	/** consecutive goal turns in which the agent reported blocked (codex blocked audit) */
 	blockedConsecutive: number;
-	/**
-	 * Deferral marker (codex thread_goal_continuation_deferrals): set whenever
-	 * the goal is written (create/update/command). While set, agent_settled
-	 * skips auto-continuation once so the user sees the result of the turn
-	 * that wrote the goal; the next user-initiated turn clears it (codex
-	 * on_turn_start clears the deferral), after which the loop resumes.
-	 */
-	deferred: boolean;
+	timeUsedSeconds: number;
 	createdAt: number;
 	updatedAt: number;
 }
 
-function emptyGoal(): Goal {
+function rowToGoal(row: Record<string, unknown>): Goal {
 	return {
-		threadId: "",
-		objective: "",
-		status: "complete",
-		tokenBudget: null,
-		tokensUsed: 0,
-		turns: 0,
-		blockedConsecutive: 0,
-		deferred: false,
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
+		sessionId: row.session_id as string,
+		objective: row.objective as string,
+		status: row.status as GoalStatus,
+		tokenBudget: row.token_budget === null ? null : (row.token_budget as number),
+		tokensUsed: row.tokens_used as number,
+		turns: row.turns as number,
+		blockedConsecutive: row.blocked_consecutive as number,
+		timeUsedSeconds: row.time_used_seconds as number,
+		createdAt: row.created_at_ms as number,
+		updatedAt: row.updated_at_ms as number,
 	};
 }
 
-function loadGoal(): Goal {
-	try {
-		if (fs.existsSync(GOAL_FILE)) {
-			const g = JSON.parse(fs.readFileSync(GOAL_FILE, "utf8")) as Partial<Goal>;
-			return { ...emptyGoal(), ...g };
-		}
-	} catch {
-		/* corrupt file -> fresh */
-	}
-	return emptyGoal();
+function loadGoal(sessionId: string): Goal | null {
+	const row = getDb().prepare("SELECT * FROM goals WHERE session_id = ?").get(sessionId);
+	return row ? rowToGoal(row as Record<string, unknown>) : null;
 }
 
 function saveGoal(g: Goal): void {
-	try {
-		fs.mkdirSync(path.dirname(GOAL_FILE), { recursive: true });
-		fs.writeFileSync(GOAL_FILE, JSON.stringify(g, null, 2));
-	} catch {
-		/* best-effort */
-	}
+	getDb()
+		.prepare(
+			`INSERT INTO goals (
+				session_id, objective, status, token_budget, tokens_used, turns,
+				blocked_consecutive, time_used_seconds, created_at_ms, updated_at_ms
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(session_id) DO UPDATE SET
+				objective = excluded.objective,
+				status = excluded.status,
+				token_budget = excluded.token_budget,
+				tokens_used = excluded.tokens_used,
+				turns = excluded.turns,
+				blocked_consecutive = excluded.blocked_consecutive,
+				time_used_seconds = excluded.time_used_seconds,
+				updated_at_ms = excluded.updated_at_ms`,
+		)
+		.run(
+			g.sessionId,
+			g.objective,
+			g.status,
+			g.tokenBudget,
+			g.tokensUsed,
+			g.turns,
+			g.blockedConsecutive,
+			g.timeUsedSeconds,
+			g.createdAt,
+			g.updatedAt,
+		);
 }
 
-let goal = loadGoal();
+function deleteGoal(sessionId: string): void {
+	// deferrals cascade on session_id
+	getDb().prepare("DELETE FROM goals WHERE session_id = ?").run(sessionId);
+}
 
-function statusLabel(s: GoalStatus): string {
-	return s.replace("_", " ").toUpperCase();
+// --- deferral (codex thread_goal_continuation_deferrals) ---
+
+function hasDeferral(sessionId: string): boolean {
+	return getDb()
+		.prepare("SELECT 1 FROM goal_continuation_deferrals WHERE session_id = ?")
+		.get(sessionId) !== undefined;
+}
+
+function setDeferral(sessionId: string): void {
+	getDb()
+		.prepare("INSERT OR IGNORE INTO goal_continuation_deferrals (session_id) VALUES (?)")
+		.run(sessionId);
+}
+
+function clearDeferral(sessionId: string): void {
+	getDb().prepare("DELETE FROM goal_continuation_deferrals WHERE session_id = ?").run(sessionId);
 }
 
 // ---------------------------------------------------------------------------
-// Token accounting (agent_end usage)
+// Session id + token accounting
 // ---------------------------------------------------------------------------
+
+function getSessionId(ctx: ExtensionContext): string {
+	return ctx.sessionManager.getSessionId();
+}
 
 /**
  * Sum the per-request token cost of this run's messages.
- *
- * IMPORTANT: usage.totalTokens is a cumulative, monotonically increasing
- * figure (context keeps growing across turns), while input/output are the
- * per-request deltas. Summing totalTokens across messages double-counts all
- * earlier history and blows up the goal's token accounting. Use input+output.
+ * IMPORTANT: usage.totalTokens is cumulative across turns; input/output are
+ * per-request deltas. Summing totalTokens double-counts history.
  */
 function extractTokenUsage(event: { messages: Array<{ usage?: { input?: number; output?: number } }> }): number {
 	let total = 0;
@@ -138,16 +198,18 @@ function extractTokenUsage(event: { messages: Array<{ usage?: { input?: number; 
 }
 
 /** Apply budget/limits after accounting; returns the new status. */
-
-/** Apply budget/limits after accounting; returns the new status. */
 function enforceLimits(g: Goal): GoalStatus {
 	if (g.status !== "active") return g.status;
 	if (g.tokenBudget !== null && g.tokensUsed >= g.tokenBudget) {
 		g.status = "budget_limited";
 	} else if (g.turns >= MAX_TURNS) {
-		g.status = "usage_limited"; // codex UsageLimited (max turns as a usage guardrail)
+		g.status = "usage_limited"; // usage guardrail (codex UsageLimited)
 	}
 	return g.status;
+}
+
+function statusLabel(s: GoalStatus): string {
+	return s.replace("_", " ").toUpperCase();
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +218,7 @@ function enforceLimits(g: Goal): GoalStatus {
 
 function continuationMessage(g: Goal): string {
 	const budget = g.tokenBudget !== null ? `${g.turns} turns / ${g.tokensUsed}/${g.tokenBudget} tokens` : `${g.turns} turns / ${g.tokensUsed} tokens`;
+	const time = g.timeUsedSeconds > 0 ? `, ${formatSeconds(g.timeUsedSeconds)} elapsed` : "";
 	return [
 		`## Goal continuation (pi-loop)`,
 		``,
@@ -164,23 +227,33 @@ function continuationMessage(g: Goal): string {
 		`If you are blocked and need the user, call update_goal with status "blocked" instead of looping.`,
 		``,
 		`<goal objective="${g.objective}">`,
-		`<progress>${budget}</progress>`,
+		`<progress>${budget}${time}</progress>`,
 		`</goal>`,
 		``,
 	].join("\n");
 }
 
+function formatSeconds(seconds: number): string {
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+	const hours = Math.floor(minutes / 60);
+	return `${hours}h ${minutes % 60}m`;
+}
+
 /**
- * Silently kick off a new turn toward the active goal. Uses sendMessage with
- * triggerTurn + display:false so the steering only enters the LLM context and
- * never shows in the transcript (codex continuation steering item). Turns
- * started this way bypass before_agent_start, so no duplicate injection.
+ * Silently kick off a new turn toward the active goal of `sessionId`.
+ * display:false so the steering only enters the LLM context and never shows
+ * in the transcript (codex continuation steering item). Turns started this
+ * way bypass before_agent_start, so no duplicate injection.
  */
-function kickoffTurn(pi: ExtensionAPI): void {
+function kickoffTurn(pi: ExtensionAPI, sessionId: string): void {
+	const g = loadGoal(sessionId);
+	if (!g) return;
 	pi.sendMessage(
 		{
 			customType: "pi-loop-continue",
-			content: continuationMessage(goal),
+			content: continuationMessage(g),
 			display: false,
 		},
 		{ triggerTurn: true, deliverAs: "steer" },
@@ -194,20 +267,28 @@ function kickoffTurn(pi: ExtensionAPI): void {
 export default function (pi: ExtensionAPI) {
 	if (!ENABLED) return;
 
-	// Steering injection before each turn when a goal is active
-	// (codex on_turn_start / inject_active_turn_steering)
-	pi.on("before_agent_start", async () => {
+	// Per-turn elapsed-time tracking (codex time_used_seconds)
+	const turnStarts = new Map<string, number>();
+	pi.on("agent_start", async (_event, ctx) => {
 		try {
-			// codex on_turn_start: clear the continuation deferral on each new turn
-			if (goal.deferred) {
-				goal.deferred = false;
-				saveGoal(goal);
-			}
-			if (goal.status !== "active") return;
+			turnStarts.set(getSessionId(ctx), Date.now());
+		} catch {
+			/* never break */
+		}
+	});
+
+	// Steering injection before each user-initiated turn when a goal is
+	// active; also clears the deferral (codex on_turn_start)
+	pi.on("before_agent_start", async (_event, ctx) => {
+		try {
+			const sid = getSessionId(ctx);
+			clearDeferral(sid); // codex on_turn_start clears the deferral
+			const g = loadGoal(sid);
+			if (!g || g.status !== "active") return;
 			return {
 				message: {
 					customType: "pi-loop-steering",
-					content: continuationMessage(goal),
+					content: continuationMessage(g),
 					display: false,
 				},
 			};
@@ -216,57 +297,56 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// Token accounting + automatic continuation (codex on_token_usage +
-	// continue_if_idle)
+	// Token + time accounting (codex on_token_usage)
 	pi.on("agent_end", async (event, ctx) => {
 		try {
-			if (goal.status !== "active") return;
-			goal.tokensUsed += extractTokenUsage(event as never);
-			enforceLimits(goal);
-			saveGoal(goal);
-			if (goal.status !== "active") {
-				ctx.ui.notify(`pi-loop: goal ${statusLabel(goal.status)} (${goal.turns} turns, ${goal.tokensUsed} tokens)`, "info");
+			const sid = getSessionId(ctx);
+			const g = loadGoal(sid);
+			if (!g || g.status !== "active") return;
+			g.tokensUsed += extractTokenUsage(event as never);
+			const start = turnStarts.get(sid);
+			if (start !== undefined) {
+				g.timeUsedSeconds += Math.max(0, Math.round((Date.now() - start) / 1000));
+				turnStarts.delete(sid);
+			}
+			enforceLimits(g);
+			g.updatedAt = Date.now();
+			saveGoal(g);
+			if (g.status !== "active") {
+				ctx.ui.notify(`pi-loop: goal ${statusLabel(g.status)} (${g.turns} turns, ${g.tokensUsed} tokens)`, "info");
 			}
 		} catch {
 			/* never break */
 		}
 	});
 
+	// Automatic continuation (codex continue_if_idle)
 	pi.on("agent_settled", async (_event, ctx) => {
 		try {
-			if (goal.status !== "active") return;
-			// codex continue_if_idle: a goal that was just written (created or
-			// updated) defers continuation once — stop and let the user see the
-			// result. Cleared on the next user-initiated turn.
-			if (goal.deferred) {
-				goal.deferred = false;
-				goal.updatedAt = Date.now();
-				saveGoal(goal);
+			const sid = getSessionId(ctx);
+			const g = loadGoal(sid);
+			if (!g || g.status !== "active") return;
+			// print/CI mode exits after one run — only auto-loop in resident modes
+			if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
+			// codex continue_if_idle: a goal that was just written defers
+			// continuation once — stop and let the user see the result.
+			if (hasDeferral(sid)) {
+				clearDeferral(sid);
 				debug("deferring continuation until next user message");
 				return;
 			}
-			// print/CI mode exits after one run, so a queued continuation never
-			// executes — only auto-loop in resident modes (TUI/RPC).
-			if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
-			goal.turns += 1; // one autonomous loop turn toward the goal
-			goal.updatedAt = Date.now();
-			enforceLimits(goal);
-			saveGoal(goal);
-			if (goal.status !== "active") {
-				// hit budget/max turns — stop the loop (codex BudgetLimited/UsageLimited)
-				return;
-			}
-			// Loop: kick off the next turn toward the goal (codex continue_if_idle)
-			debug("continuing goal", goal.objective.slice(0, 60));
-			kickoffTurn(pi);
+			g.turns += 1;
+			enforceLimits(g);
+			g.updatedAt = Date.now();
+			saveGoal(g);
+			if (g.status !== "active") return;
+			debug("continuing goal", g.objective.slice(0, 60));
+			kickoffTurn(pi, sid);
 		} catch {
 			/* never break */
 		}
 	});
 
-	// ------------------------------------------------------------------
-	// goal tool (codex create_goal / update_goal / get_goal)
-	// ------------------------------------------------------------------
 	// ------------------------------------------------------------------
 	// goal tools (codex create_goal / update_goal / get_goal)
 	// ------------------------------------------------------------------
@@ -282,26 +362,28 @@ export default function (pi: ExtensionAPI) {
 			objective: Type.String({ description: "Required. The concrete objective to start pursuing. Starts a new active goal when none exists or replaces a completed one." }),
 			token_budget: Type.Optional(Type.Integer({ description: "Positive token budget for the new goal. Omit unless explicitly requested." })),
 		}),
-		async execute(_id, params) {
-			if (!params.objective?.trim()) return textResult("create_goal: objective is required", true);
-			if (goal.status === "active") {
-				return textResult(`create_goal: an unfinished goal already exists — ${goal.objective}. Use get_goal / update_goal instead.`, true);
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const sid = getSessionId(ctx);
+			const existing = loadGoal(sid);
+			if (existing && existing.status === "active") {
+				return textResult(`create_goal: an unfinished goal already exists — ${existing.objective}. Use get_goal / update_goal instead.`, true);
 			}
-			goal = {
-				threadId: "session",
+			const now = Date.now();
+			const g: Goal = {
+				sessionId: sid,
 				objective: params.objective.trim().slice(0, 2000),
 				status: "active",
 				tokenBudget: params.token_budget ?? DEFAULT_BUDGET,
 				tokensUsed: 0,
 				turns: 0,
 				blockedConsecutive: 0,
-				deferred: true,
-				createdAt: Date.now(),
-				updatedAt: Date.now(),
+				timeUsedSeconds: 0,
+				createdAt: now,
+				updatedAt: now,
 			};
-			saveGoal(goal); // pause auto-continuation until the user's next message
-			saveGoal(goal);
-			return textResult(`goal created: ${goal.objective} (active${goal.tokenBudget !== null ? `, budget ${goal.tokenBudget}` : ""})`);
+			saveGoal(g);
+			setDeferral(sid); // pause auto-continuation until the user's next message
+			return textResult(`goal created: ${g.objective} (active${g.tokenBudget !== null ? `, budget ${g.tokenBudget}` : ""})`);
 		},
 	});
 
@@ -321,32 +403,34 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			status: Type.Union([Type.Literal("complete"), Type.Literal("blocked")]),
 		}),
-		async execute(_id, params) {
-			if (!goal.objective) return textResult("update_goal: no goal exists — use create_goal first", true);
-			if (goal.status !== "active") {
-				return textResult(`update_goal: goal is ${statusLabel(goal.status)}; only active goals can be updated`, true);
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const sid = getSessionId(ctx);
+			const g = loadGoal(sid);
+			if (!g) return textResult("update_goal: no goal exists — use create_goal first", true);
+			if (g.status !== "active") {
+				return textResult(`update_goal: goal is ${statusLabel(g.status)}; only active goals can be updated`, true);
 			}
 			if (params.status === "complete") {
-				goal.status = "complete";
-				goal.blockedConsecutive = 0;
-				goal.deferred = true;
-				goal.updatedAt = Date.now();
-				saveGoal(goal);
-				return textResult(`goal complete: ${goal.objective} (${goal.turns} turns, ${goal.tokensUsed} tokens used)`);
+				g.status = "complete";
+				g.blockedConsecutive = 0;
+				g.updatedAt = Date.now();
+				saveGoal(g);
+				setDeferral(sid);
+				return textResult(`goal complete: ${g.objective} (${g.turns} turns, ${g.tokensUsed} tokens used, ${formatSeconds(g.timeUsedSeconds)})`);
 			}
 			// blocked: require 3 consecutive turns stuck on the same condition
-			goal.blockedConsecutive += 1;
-			goal.updatedAt = Date.now();
-			saveGoal(goal);
-			if (goal.blockedConsecutive < 3) {
+			g.blockedConsecutive += 1;
+			g.updatedAt = Date.now();
+			saveGoal(g);
+			if (g.blockedConsecutive < 3) {
 				return textResult(
-					`blocked reported (${goal.blockedConsecutive}/3 consecutive). Keep trying; only set blocked after 3 consecutive goal turns on the same obstacle.`,
+					`blocked reported (${g.blockedConsecutive}/3 consecutive). Keep trying; only set blocked after 3 consecutive goal turns on the same obstacle.`,
 				);
 			}
-			goal.status = "blocked";
-			goal.deferred = true;
-			saveGoal(goal);
-			return textResult(`goal blocked: ${goal.objective} (after ${goal.blockedConsecutive} consecutive turns)`);
+			g.status = "blocked";
+			saveGoal(g);
+			setDeferral(sid);
+			return textResult(`goal blocked: ${g.objective} (after ${g.blockedConsecutive} consecutive turns)`);
 		},
 	});
 
@@ -354,48 +438,51 @@ export default function (pi: ExtensionAPI) {
 		name: "get_goal",
 		label: "Get Goal",
 		description:
-			"Get the current goal for this thread, including status, budgets, token usage, and remaining token budget.",
+			"Get the current goal for this session, including status, budgets, token and time usage, and remaining token budget.",
 		promptSnippet: "Check the current goal with get_goal before deciding whether to keep working.",
 		parameters: Type.Object({}),
-		async execute() {
-			if (!goal.objective) return textResult("no goal");
-			const remaining = goal.tokenBudget !== null ? Math.max(0, goal.tokenBudget - goal.tokensUsed) : null;
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			const g = loadGoal(getSessionId(ctx));
+			if (!g) return textResult("no goal");
+			const remaining = g.tokenBudget !== null ? Math.max(0, g.tokenBudget - g.tokensUsed) : null;
 			return textResult(
-				`goal: ${statusLabel(goal.status)}\nobjective: ${goal.objective}\nprogress: ${goal.turns} turns, ${goal.tokensUsed} tokens${goal.tokenBudget !== null ? ` / ${goal.tokenBudget} budget (${remaining} remaining)` : ""}\ncreated: ${new Date(goal.createdAt).toISOString()}`,
+				`goal: ${statusLabel(g.status)}\nobjective: ${g.objective}\nprogress: ${g.turns} turns, ${g.tokensUsed} tokens${g.tokenBudget !== null ? ` / ${g.tokenBudget} budget (${remaining} remaining)` : ""}${g.timeUsedSeconds > 0 ? `, ${formatSeconds(g.timeUsedSeconds)} elapsed` : ""}\ncreated: ${new Date(g.createdAt).toISOString()}`,
 			);
 		},
 	});
+
+	// ------------------------------------------------------------------
+	// /goal command (codex usage: /goal [<objective>|clear|edit|pause|resume])
+	// ------------------------------------------------------------------
 	pi.registerCommand("goal", {
 		description:
 			"pi-loop: /goal [<objective>|clear|edit|pause|resume] (Codex usage)",
 		handler: async (args, ctx) => {
 			const parts = (args || "").trim().split(/\s+/);
 			const sub = (parts[0] || "").toLowerCase();
+			const sid = getSessionId(ctx);
 			// Codex usage: /goal <objective> sets the goal directly. A trailing
-			// number on the objective is treated as an explicit token budget
-			// (pi extension; codex sets budgets via tool/config only).
+			// number on the objective is an explicit token budget (pi extension).
 			const setGoal = (objective: string, budget: number | null) => {
-				goal = {
-					threadId: "session",
+				const now = Date.now();
+				const g: Goal = {
+					sessionId: sid,
 					objective: objective.slice(0, 2000),
 					status: "active",
 					tokenBudget: budget,
 					tokensUsed: 0,
 					turns: 0,
 					blockedConsecutive: 0,
-					deferred: true,
-					createdAt: Date.now(),
-					updatedAt: Date.now(),
+					timeUsedSeconds: 0,
+					createdAt: now,
+					updatedAt: now,
 				};
-				// deferred: run one turn, then stop for the user (codex deferral)
-				saveGoal(goal);
-				ctx.ui.notify(`pi-loop: goal set — ${goal.objective} (active, ${budget ?? "no"} token budget)`, "info");
-				// kick off the first turn toward the goal immediately (codex
-				// continue_if_idle after setting a goal), silently
-				kickoffTurn(pi);
+				saveGoal(g);
+				setDeferral(sid); // deferred: run one turn, then stop for the user
+				ctx.ui.notify(`pi-loop: goal set — ${g.objective} (active, ${budget ?? "no"} token budget)`, "info");
+				kickoffTurn(pi, sid); // codex continue_if_idle after setting a goal
 			};
 			if (sub === "set" || sub === "edit") {
-				// pi compat: /goal set <objective>; codex uses /goal edit
 				const objective = (args || "").slice(parts[0].length).trim();
 				if (!objective) {
 					ctx.ui.notify("pi-loop: usage — /goal <objective> [token_budget]", "warning");
@@ -408,45 +495,47 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (sub === "pause") {
-				if (goal.status !== "complete" && goal.objective) {
-					goal.status = "paused";
-					goal.deferred = true;
-					goal.updatedAt = Date.now();
-					saveGoal(goal);
+				const g = loadGoal(sid);
+				if (g && g.status !== "complete" && g.objective) {
+					g.status = "paused";
+					g.updatedAt = Date.now();
+					saveGoal(g);
+					setDeferral(sid);
 					ctx.ui.notify("pi-loop: goal paused", "info");
 				} else ctx.ui.notify("pi-loop: no active goal to pause", "warning");
 				return;
 			}
 			if (sub === "resume") {
-				if (goal.objective) {
-					goal.status = "active";
-					goal.deferred = true; // one turn, then wait for the user
-					goal.updatedAt = Date.now();
-					saveGoal(goal);
-					ctx.ui.notify(`pi-loop: goal resumed — ${goal.objective}`, "info");
-					kickoffTurn(pi);
+				const g = loadGoal(sid);
+				if (g && g.objective) {
+					g.status = "active";
+					g.updatedAt = Date.now();
+					saveGoal(g);
+					setDeferral(sid); // one turn, then wait for the user
+					ctx.ui.notify(`pi-loop: goal resumed — ${g.objective}`, "info");
+					kickoffTurn(pi, sid);
 				} else ctx.ui.notify("pi-loop: no goal to resume", "warning");
 				return;
 			}
 			if (sub === "clear") {
-				goal = emptyGoal();
-				goal.deferred = true;
-				saveGoal(goal);
+				deleteGoal(sid);
+				clearDeferral(sid);
 				ctx.ui.notify("pi-loop: goal cleared", "info");
 				return;
 			}
-			// No argument: show the current goal summary (codex /goal with no args).
+			// No argument: show the current goal summary (codex /goal, no args)
 			if (!sub) {
-				if (!goal.objective) {
+				const g = loadGoal(sid);
+				if (!g) {
 					ctx.ui.notify("pi-loop: no goal. Usage: /goal <objective> [token_budget]", "info");
 					return;
 				}
 				ctx.ui.notify(
 					[
-						`pi-loop goal (${statusLabel(goal.status)})`,
-						`objective: ${goal.objective}`,
-						`progress: ${goal.turns} turns, ${goal.tokensUsed} tokens${goal.tokenBudget !== null ? ` / ${goal.tokenBudget} budget` : ""}`,
-						`created: ${new Date(goal.createdAt).toISOString()}`,
+						`pi-loop goal (${statusLabel(g.status)})`,
+						`objective: ${g.objective}`,
+						`progress: ${g.turns} turns, ${g.tokensUsed} tokens${g.tokenBudget !== null ? ` / ${g.tokenBudget} budget` : ""}${g.timeUsedSeconds > 0 ? `, ${formatSeconds(g.timeUsedSeconds)} elapsed` : ""}`,
+						`created: ${new Date(g.createdAt).toISOString()}`,
 						`max turns: ${MAX_TURNS}`,
 					].join("\n"),
 					"info",
@@ -454,7 +543,6 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			// Anything else is the objective: /goal improve benchmark coverage
-			// (Codex usage). Trailing number = explicit token budget.
 			const m = (args || "").trim().match(/^(.*?)\s+(\d+)\s*$/);
 			const text = m ? m[1] : (args || "").trim();
 			const budget = m ? Number(m[2]) : DEFAULT_BUDGET;
