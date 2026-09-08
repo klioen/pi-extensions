@@ -55,6 +55,8 @@ const MAX_ROLLOUT_AGE_DAYS = Math.max(1, Number(process.env.PI_MEMORY_MAX_ROLLOU
 const SCAN_LIMIT = Math.max(1, Number(process.env.PI_MEMORY_SCAN_LIMIT) || 5000); // codex THREAD_SCAN_LIMIT
 const MAX_ROLLOUTS_PER_STARTUP = Math.max(1, Number(process.env.PI_MEMORY_MAX_ROLLOUTS_PER_STARTUP) || 2); // codex default = 2
 const WORKER_POLL_MS = Math.max(500, Number(process.env.PI_MEMORY_WORKER_POLL_MS) || 3000);
+const WORKER_LOG_PATH = process.env.PI_MEMORY_WORKER_LOG || path.join(MEMORY_DIR, "worker.log");
+const WORKER_TUI_LOGS = process.env.PI_MEMORY_WORKER_TUI_LOGS === "1";
 
 // DB state keys
 const DB_STATE_KEY = "pi-memory-state";
@@ -332,9 +334,17 @@ function startWorker(ctxModel: unknown): void {
 		rolloutCharLimit: ROLLOUT_CHAR_LIMIT,
 		llm: resolveExtractModel(ctxModel),
 	};
-	worker = fork(workerPath, [], { stdio: ["ignore", "ignore", "inherit", "ipc"], execArgv: ["--no-warnings"] });
+	// Never inherit worker stderr into the TUI: repeated phase1 failures can
+	// consume the footer and shrink the input editor. Persist diagnostics to a
+	// local log; opt into live TUI output only for debugging.
+	fs.mkdirSync(MEMORY_DIR, { recursive: true });
+	worker = fork(workerPath, [], { stdio: ["ignore", "ignore", "pipe", "ipc"], execArgv: ["--no-warnings"] });
+	worker.stderr?.on("data", (chunk: Buffer) => {
+		try { fs.appendFileSync(WORKER_LOG_PATH, chunk); } catch { /* best-effort */ }
+		if (WORKER_TUI_LOGS) process.stderr.write(chunk);
+	});
 	worker.send({ type: "config", config: workerConfig });
-	worker.on("exit", (code, signal) => {
+	worker.on("exit", () => {
 		worker = null;
 	});
 }
@@ -502,7 +512,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const sub = (args || "").trim().split(/\s+/)[0];
 			if (sub === "path") {
-				ctx.ui.notify(`Memory dir: ${MEMORY_DIR}\nDB: ${DB_PATH}`, "info");
+				ctx.ui.notify(`Memory dir: ${MEMORY_DIR}\nDB: ${DB_PATH}\nWorker log: ${WORKER_LOG_PATH}`, "info");
 				return;
 			}
 			if (sub === "consolidate") {
@@ -538,6 +548,7 @@ export default function (pi: ExtensionAPI) {
 					`pi-memory`,
 					`dir: ${MEMORY_DIR}`,
 					`worker: ${worker ? `running (pid ${worker.pid})` : "stopped"}`,
+					`worker_log: ${WORKER_LOG_PATH}`,
 					`rollout_summaries: ${rolloutFiles.length}`,
 					`skills: ${skills.length}`,
 					`raw_memories.md: ${rawSize} bytes`,
