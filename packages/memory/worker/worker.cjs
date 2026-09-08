@@ -257,8 +257,8 @@ function ensureLayout() {
 async function runPhase1(row) {
 	const payload = JSON.parse(row.payload);
 	let transcript = payload.transcript; // backward compatibility with old queued jobs
-	let rolloutCwd = payload.rolloutCwd || "";
-	if (payload.rolloutPath && fs.existsSync(payload.rolloutPath)) {
+	let rolloutCwd = typeof payload.rolloutCwd === "string" ? payload.rolloutCwd : "";
+	if (typeof payload.rolloutPath === "string" && fs.existsSync(payload.rolloutPath)) {
 		// Codex loads the full stable rollout AFTER claim. Do the same instead of
 		// relying on a scanner-time tail snapshot.
 		const parsedSession = sessionTranscriptFromJsonl(fs.readFileSync(payload.rolloutPath, "utf8"), cfg.rolloutCharLimit || 20_000);
@@ -266,23 +266,43 @@ async function runPhase1(row) {
 		rolloutCwd = parsedSession.cwd || rolloutCwd || path.dirname(payload.rolloutPath);
 	}
 	if (!transcript || !String(transcript).trim()) throw new Error("rollout transcript unavailable or empty");
-	const prompt = phase1Prompt(transcript, payload.rolloutPath, rolloutCwd);
-	const raw = await completeLLM(cfg.llm, prompt);
-	const parsed = parseJsonObj(raw);
-	if (!parsed || (!parsed.raw_memory && !parsed.rollout_summary)) throw new Error("phase1 LLM output unparseable or empty");
-	// Codex redacts secrets deterministically before persisting stage-1 output.
-	const rawMemory = redactSecrets(parsed.raw_memory || "");
-	const rolloutSummary = redactSecrets(parsed.rollout_summary || "");
-	const rolloutSlug = parsed.rollout_slug ? redactSecrets(parsed.rollout_slug) : null;
-	const sourceUpdatedAt = row.input_watermark || Date.now(); // codex: source_updated_at = the input watermark
+	const prompt = phase1Prompt(String(transcript), typeof payload.rolloutPath === "string" ? payload.rolloutPath : "", rolloutCwd);
+	let raw = await completeLLM(cfg.llm, prompt);
+	let parsed = parseJsonObj(raw);
+	if (!parsed) {
+		// Models occasionally return prose or a truncated object despite the
+		// prompt. Retry once with an explicit repair instruction before failing.
+		const retryPrompt = `${prompt}\n\nYour previous response was invalid. Return ONLY one valid JSON object with string fields raw_memory, rollout_summary, rollout_slug. Do not explain.`;
+		raw = await completeLLM(cfg.llm, retryPrompt);
+		parsed = parseJsonObj(raw);
+	}
+	if (!parsed || typeof parsed !== "object") {
+		debug(`phase1 ${row.job_key}: invalid LLM response (${String(raw).length} chars): ${redactSecrets(String(raw)).slice(0, 500)}`);
+		throw new Error(`phase1 LLM output unparseable or empty (response ${String(raw).length} chars after retry)`);
+	}
+	// Codex treats an incomplete stage1 result as no-output, not a retryable
+	// failure. Normalize every SQLite-bound value so malformed optional fields
+	// can never pass undefined into node:sqlite.
+	const rawMemory = redactSecrets(typeof parsed.raw_memory === "string" ? parsed.raw_memory : "").trim();
+	const rolloutSummary = redactSecrets(typeof parsed.rollout_summary === "string" ? parsed.rollout_summary : "").trim();
+	if (!rawMemory || !rolloutSummary) {
+		debug(`phase1 ${row.job_key}: valid but empty/incomplete output; completing without stage1 row`);
+		return;
+	}
+	const rolloutSlug = typeof parsed.rollout_slug === "string" && parsed.rollout_slug.trim()
+		? redactSecrets(parsed.rollout_slug.trim())
+		: null;
+	const threadId = typeof payload.threadId === "string" && payload.threadId ? payload.threadId : row.job_key;
+	const sourceUpdatedAt = Number(row.input_watermark) || Date.now(); // codex: source_updated_at = input watermark
+	const cwd = typeof rolloutCwd === "string" ? rolloutCwd : "";
 	db.prepare(
 		`INSERT INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, generated_at, rollout_slug, cwd, usage_count, last_usage)
      VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)
      ON CONFLICT(thread_id) DO UPDATE SET source_updated_at=excluded.source_updated_at, raw_memory=excluded.raw_memory,
        rollout_summary=excluded.rollout_summary, generated_at=excluded.generated_at,
        rollout_slug=excluded.rollout_slug, cwd=excluded.cwd`,
-	).run(payload.threadId, sourceUpdatedAt, rawMemory, rolloutSummary, Date.now(), rolloutSlug, rolloutCwd);
-	debug(`phase1 done: ${payload.threadId} -> stage1_outputs (watermark ${sourceUpdatedAt})`);
+	).run(threadId, sourceUpdatedAt, rawMemory, rolloutSummary, Date.now(), rolloutSlug, cwd);
+	debug(`phase1 done: ${threadId} -> stage1_outputs (watermark ${sourceUpdatedAt})`);
 	// phase-1 success advances the phase-2 watermark (codex: enqueue_global_consolidation)
 	enqueuePhase2();
 }
