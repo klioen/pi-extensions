@@ -19,7 +19,14 @@ const { DatabaseSync } = require("node:sqlite");
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
-const { SCHEMA, phase1Prompt, completeLLM, parseJsonObj } = require(path.join(__dirname, "..", "lib", "memory-core.cjs"));
+const {
+	SCHEMA,
+	phase1Prompt,
+	completeLLM,
+	parseJsonObj,
+	redactSecrets,
+	sessionTranscriptFromJsonl,
+} = require(path.join(__dirname, "..", "lib", "memory-core.cjs"));
 
 const WORKER_ID = `w-${process.pid}`;
 const POLL_MS_DEFAULT = 60_000; // fallback interval when nothing is due (codex: work is triggered, not polled)
@@ -27,8 +34,9 @@ const LEASE_MS = 60 * 60 * 1000;        // 1h lease (codex JOB_LEASE_SECONDS=360
 const RETRY_DELAY_MS = 60 * 60 * 1000;  // 1h retry backoff (codex JOB_RETRY_DELAY_SECONDS)
 const PHASE2_SUCCESS_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h cooldown (codex)
 const PHASE2_AGENT_TIMEOUT_MS = 10 * 60 * 1000;
-const CONCURRENCY = 4;
+const CONCURRENCY = Math.max(1, Number(process.env.PI_MEMORY_PHASE1_CONCURRENCY) || 8); // codex default = 8
 const MIN_ROLLOUT_IDLE_MS = (process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS === undefined ? 6 : Number(process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS)) * 3600 * 1000; // codex default 6h; explicit 0 disables the idle gate
+const MAX_UNUSED_DAYS = Math.max(1, Number(process.env.PI_MEMORY_MAX_UNUSED_DAYS) || 30); // codex default = 30
 
 let cfg = null;
 let db = null;
@@ -45,6 +53,7 @@ function openDb() {
 	db = new DatabaseSync(cfg.dbPath);
 	db.exec("PRAGMA journal_mode=WAL;");
 	db.exec(SCHEMA);
+	try { db.exec("ALTER TABLE stage1_outputs ADD COLUMN generated_at INTEGER"); } catch { /* already migrated */ }
 	db.exec(`CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
 }
 
@@ -69,11 +78,15 @@ function claimPhase1Jobs() {
 	const idleCutoff = now - MIN_ROLLOUT_IDLE_MS;
 	const allRows = db.prepare(
 		`SELECT * FROM jobs
-       WHERE kind = 'phase1' AND status IN ('pending','failed')
-         AND (status = 'pending' OR (retry_until IS NOT NULL AND retry_until <= ?))
-         AND (lease_until IS NULL OR lease_until <= ?)
+       WHERE kind = 'phase1'
+         AND retry_remaining > 0
+         AND (
+           status = 'pending'
+           OR (status = 'failed' AND retry_until IS NOT NULL AND retry_until <= ?)
+           OR (status = 'leased' AND lease_until IS NOT NULL AND lease_until <= ?)
+         )
        ORDER BY created_at ASC LIMIT ?`,
-	).all(now, now, CONCURRENCY * 4);
+	).all(now, now, CONCURRENCY);
 	// Drop not-yet-idle jobs (keep them pending for a later poll).
 	const rows = allRows.filter((row) => {
 		if (!row.input_watermark) return true; // no ts → no idle gate (legacy)
@@ -88,18 +101,32 @@ function claimPhase1Jobs() {
 		return output && Number(output.source_updated_at) >= Number(row.input_watermark);
 	});
 	for (const row of upToDate) {
-		// job was never claimed, so no ownership token — update status directly
-		db.prepare(`UPDATE jobs SET status='completed', finished_at=? WHERE kind='phase1' AND job_key=?`).run(Date.now(), row.job_key);
-		debug(`phase1 ${row.job_key}: up-to-date (watermark ${row.input_watermark}), skipping`);
+		// Claim only if the row is still unowned/expired. Never overwrite a
+		// concurrent worker's fresh lease just because this scanner saw an older
+		// snapshot of the row.
+		const completed = db.prepare(
+			`UPDATE jobs SET status='completed', finished_at=?
+			 WHERE kind='phase1' AND job_key=?
+			   AND (status='pending'
+			        OR (status='failed' AND retry_until IS NOT NULL AND retry_until <= ?)
+			        OR (status='leased' AND lease_until IS NOT NULL AND lease_until <= ?))`,
+		).run(Date.now(), row.job_key, now, now);
+		if (completed.changes > 0) debug(`phase1 ${row.job_key}: up-to-date (watermark ${row.input_watermark}), skipping`);
 	}
 	const eligible = rows.filter((row) => !upToDate.includes(row));
 	const stmt = db.prepare(
-		`UPDATE jobs SET status='leased', worker_id=?, ownership_token=?, lease_until=? WHERE kind='phase1' AND job_key=? AND status IN ('pending','failed')`,
+		`UPDATE jobs SET status='leased', worker_id=?, ownership_token=?, lease_until=?
+		 WHERE kind='phase1' AND job_key=? AND retry_remaining > 0
+		   AND (
+		     status='pending'
+		     OR (status='failed' AND retry_until IS NOT NULL AND retry_until <= ?)
+		     OR (status='leased' AND lease_until IS NOT NULL AND lease_until <= ?)
+		   )`,
 	);
 	const claimed = [];
 	for (const row of eligible) {
 		const token = `${WORKER_ID}-${row.job_key}-${Date.now()}`;
-		if (stmt.run(WORKER_ID, token, now + LEASE_MS, row.job_key).changes > 0) {
+		if (stmt.run(WORKER_ID, token, now + LEASE_MS, row.job_key, now, now).changes > 0) {
 			row.ownership_token = token;
 			claimed.push(row);
 		}
@@ -229,17 +256,32 @@ function ensureLayout() {
 // are materialized later by phase-2 (sync_rollout_summaries_from_memories).
 async function runPhase1(row) {
 	const payload = JSON.parse(row.payload);
-	const prompt = phase1Prompt(payload.transcript, payload.rolloutPath, payload.rolloutCwd);
+	let transcript = payload.transcript; // backward compatibility with old queued jobs
+	let rolloutCwd = payload.rolloutCwd || "";
+	if (payload.rolloutPath && fs.existsSync(payload.rolloutPath)) {
+		// Codex loads the full stable rollout AFTER claim. Do the same instead of
+		// relying on a scanner-time tail snapshot.
+		const parsedSession = sessionTranscriptFromJsonl(fs.readFileSync(payload.rolloutPath, "utf8"), cfg.rolloutCharLimit || 20_000);
+		transcript = parsedSession.transcript;
+		rolloutCwd = parsedSession.cwd || rolloutCwd || path.dirname(payload.rolloutPath);
+	}
+	if (!transcript || !String(transcript).trim()) throw new Error("rollout transcript unavailable or empty");
+	const prompt = phase1Prompt(transcript, payload.rolloutPath, rolloutCwd);
 	const raw = await completeLLM(cfg.llm, prompt);
 	const parsed = parseJsonObj(raw);
 	if (!parsed || (!parsed.raw_memory && !parsed.rollout_summary)) throw new Error("phase1 LLM output unparseable or empty");
+	// Codex redacts secrets deterministically before persisting stage-1 output.
+	const rawMemory = redactSecrets(parsed.raw_memory || "");
+	const rolloutSummary = redactSecrets(parsed.rollout_summary || "");
+	const rolloutSlug = parsed.rollout_slug ? redactSecrets(parsed.rollout_slug) : null;
 	const sourceUpdatedAt = row.input_watermark || Date.now(); // codex: source_updated_at = the input watermark
 	db.prepare(
-		`INSERT INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, rollout_slug, cwd)
-     VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, generated_at, rollout_slug, cwd, usage_count, last_usage)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)
      ON CONFLICT(thread_id) DO UPDATE SET source_updated_at=excluded.source_updated_at, raw_memory=excluded.raw_memory,
-       rollout_summary=excluded.rollout_summary, rollout_slug=excluded.rollout_slug, cwd=excluded.cwd`,
-	).run(payload.threadId, sourceUpdatedAt, parsed.raw_memory, parsed.rollout_summary, parsed.rollout_slug ?? null, payload.rolloutCwd);
+       rollout_summary=excluded.rollout_summary, generated_at=excluded.generated_at,
+       rollout_slug=excluded.rollout_slug, cwd=excluded.cwd`,
+	).run(payload.threadId, sourceUpdatedAt, rawMemory, rolloutSummary, Date.now(), rolloutSlug, rolloutCwd);
 	debug(`phase1 done: ${payload.threadId} -> stage1_outputs (watermark ${sourceUpdatedAt})`);
 	// phase-1 success advances the phase-2 watermark (codex: enqueue_global_consolidation)
 	enqueuePhase2();
@@ -334,10 +376,26 @@ function rolloutStem(m) {
 
 function materializePhase2Inputs() {
 	ensureLayout();
-	// codex get_phase2_input_selection: newest first, cap at MAX
+	// Codex get_phase2_input_selection: retain recently used outputs first,
+	// otherwise recent never-used outputs; then stable source/thread ordering.
+	const unusedCutoff = Date.now() - MAX_UNUSED_DAYS * 24 * 3600 * 1000;
 	const selected = db.prepare(
-		`SELECT * FROM stage1_outputs ORDER BY source_updated_at DESC, thread_id DESC LIMIT ?`,
-	).all(MAX_RAW_FOR_CONSOLIDATION);
+		`SELECT * FROM stage1_outputs
+		 WHERE length(trim(raw_memory)) > 0 OR length(trim(rollout_summary)) > 0
+		   AND ((last_usage IS NOT NULL AND last_usage >= ?)
+		        OR (last_usage IS NULL AND source_updated_at >= ?))
+		 ORDER BY COALESCE(usage_count, 0) DESC,
+		          COALESCE(last_usage, source_updated_at) DESC,
+		          source_updated_at DESC, thread_id DESC
+		 LIMIT ?`,
+	).all(unusedCutoff, unusedCutoff, MAX_RAW_FOR_CONSOLIDATION);
+	// Codex max_unused_days retention. The next workspace sync also prunes
+	// materialized rollout files no longer selected.
+	db.prepare(
+		`DELETE FROM stage1_outputs
+		 WHERE (last_usage IS NOT NULL AND last_usage < ?)
+		    OR (last_usage IS NULL AND source_updated_at < ?)`,
+	).run(unusedCutoff, unusedCutoff);
 
 	// prune rollout summaries not in the selection (codex prune_rollout_summaries)
 	const keep = new Set(selected.map((m) => rolloutStem(m)));
@@ -407,12 +465,16 @@ async function runPhase2AsAgent(row) {
 		PI_MEMORY_RECALL: "0",      // no recall injection in the child
 		PI_MEMORY_AGENT_CHILD: "1", // child must not fork its own worker (no chain)
 	};
-	const args = ["--print"];
+	// Codex runs consolidation as a restricted internal worker. pi does not yet
+	// expose a filesystem-root sandbox here, but we can remove every extension,
+	// skill, shell and network-capable tool and limit the child to local memory
+	// workspace editing primitives.
+	const args = ["--print", "--no-extensions", "--no-skills", "--tools", "read,grep,edit,write"];
 	if (modelSpec) args.push("--model", modelSpec);
 	args.push(prompt);
 
-	log(`phase2: spawning pi agent (model=${modelSpec})`);
-	const child = spawn("pi", args, { env, stdio: ["ignore", "pipe", "pipe"] });
+	log(`phase2: spawning restricted pi agent (model=${modelSpec})`);
+	const child = spawn("pi", args, { env, cwd: cfg.memDir, stdio: ["ignore", "pipe", "pipe"] });
 	let stdout = "";
 	let stderr = "";
 	let settled = false;
@@ -481,13 +543,13 @@ async function pollOnce() {
 	polling = true;
 	let didWork = false;
 	try {
-		// phase 1 jobs
+		// Phase 1 jobs run concurrently (Codex buffer_unordered(CONCURRENCY_LIMIT)).
 		const phase1 = claimPhase1Jobs();
 		if (phase1.length > 0) didWork = true;
-		for (const row of phase1) {
+		await Promise.all(phase1.map(async (row) => {
 			try { await runPhase1(row); markCompleted(row); }
 			catch (err) { log(`phase1 ${row.job_key} failed:`, err.message); markFailed(row, err.message); }
-		}
+		}));
 		// phase 2 singleton
 		let claim = claimPhase2();
 		if (claim.outcome === "recycled") claim = claimPhase2(); // retry after pending reset

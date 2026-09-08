@@ -37,6 +37,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import memoryCore from "../lib/memory-core.cjs";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -50,8 +51,9 @@ const SUMMARY_TOKEN_LIMIT = Math.max(500, Number(process.env.PI_MEMORY_SUMMARY_T
 const ROLLOUT_CHAR_LIMIT = Math.max(4000, Number(process.env.PI_MEMORY_ROLLOUT_CHARS) || 20000);
 const EXTRACT_MODEL = process.env.PI_MEMORY_EXTRACT_MODEL || ""; // optional override, like codex extract_model
 const MIN_ROLLOUT_IDLE_HOURS = process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS === undefined ? 6 : Math.max(0, Number(process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS)); // codex default 6h; explicit 0 disables
-const MAX_ROLLOUT_AGE_DAYS = Math.max(1, Number(process.env.PI_MEMORY_MAX_ROLLOUT_AGE_DAYS) || 30); // codex max_rollout_age_days
-const SCAN_LIMIT = Math.max(1, Number(process.env.PI_MEMORY_SCAN_LIMIT) || 20); // codex THREAD_SCAN_LIMIT
+const MAX_ROLLOUT_AGE_DAYS = Math.max(1, Number(process.env.PI_MEMORY_MAX_ROLLOUT_AGE_DAYS) || 10); // codex default = 10
+const SCAN_LIMIT = Math.max(1, Number(process.env.PI_MEMORY_SCAN_LIMIT) || 5000); // codex THREAD_SCAN_LIMIT
+const MAX_ROLLOUTS_PER_STARTUP = Math.max(1, Number(process.env.PI_MEMORY_MAX_ROLLOUTS_PER_STARTUP) || 2); // codex default = 2
 const WORKER_POLL_MS = Math.max(500, Number(process.env.PI_MEMORY_WORKER_POLL_MS) || 3000);
 
 // DB state keys
@@ -67,6 +69,7 @@ let db: DatabaseSync | null = null;
 function getDb(): DatabaseSync {
 	if (!db) {
 		fs.mkdirSync(MEMORY_DIR, { recursive: true });
+		fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 		db = new DatabaseSync(DB_PATH);
 		db.exec("PRAGMA journal_mode=WAL;");
 		db.exec(`
@@ -93,6 +96,7 @@ CREATE TABLE IF NOT EXISTS stage1_outputs (
     source_updated_at INTEGER NOT NULL,
     raw_memory TEXT NOT NULL,
     rollout_summary TEXT NOT NULL,
+    generated_at INTEGER,
     rollout_slug TEXT,
     cwd TEXT,
     git_branch TEXT,
@@ -101,6 +105,8 @@ CREATE TABLE IF NOT EXISTS stage1_outputs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status_lease ON jobs(status, lease_until);
 `);
+		// Safe forward migration for databases created before generated_at.
+		try { db.exec("ALTER TABLE stage1_outputs ADD COLUMN generated_at INTEGER"); } catch { /* already migrated */ }
 	}
 	return db;
 }
@@ -109,12 +115,19 @@ function enqueueJob(kind: string, jobKey: string, payload: unknown): void {
 	enqueueJobWithWatermark(kind, jobKey, 0, payload);
 }
 
-function enqueueJobWithWatermark(kind: string, jobKey: string, inputWatermark: number, payload: unknown): void {
+function enqueueJobWithWatermark(kind: string, jobKey: string, inputWatermark: number, payload: unknown): boolean {
 	const d = getDb();
+	// Never replace a leased phase-1 job: doing so discards its ownership token
+	// and lets duplicate scans run the same rollout twice. This mirrors Codex's
+	// stage1_source_needs_update + atomic try_claim_stage1_job sequence.
+	if (kind === "phase1") {
+		return memoryCore.upsertPhase1Job(d, jobKey, inputWatermark, payload);
+	}
 	d.prepare(
 		`INSERT OR REPLACE INTO jobs (kind, job_key, status, retry_remaining, payload, input_watermark, created_at)
      VALUES (?, ?, 'pending', 3, ?, ?, ?)`,
 	).run(kind, jobKey, JSON.stringify(payload), inputWatermark, Date.now());
+	return true;
 }
 
 function upsertState(key: string, value: unknown): void {
@@ -185,11 +198,11 @@ function sessionsRoot(): string {
 }
 
 /**
- * Read the tail of a session file, returning the transcript (latest messages)
- * and the timestamp of the last user/assistant message. Reads only the tail
- * (up to 512KB) so the scan is cheap even for long sessions.
+ * Read the tail of a session file to obtain only the timestamp of its last
+ * user/assistant message. The worker loads the full stable rollout after it
+ * claims the job; this scan stays cheap (at most 512KB per candidate).
  */
-function readSessionTail(file: string): { transcript: string; lastTs: number } | null {
+function readSessionTail(file: string): { lastTs: number } | null {
 	let size: number;
 	try {
 		size = fs.statSync(file).size;
@@ -206,7 +219,6 @@ function readSessionTail(file: string): { transcript: string; lastTs: number } |
 	} catch {
 		return null;
 	}
-	const parts: string[] = [];
 	let lastTs = 0;
 	for (const line of buf.toString("utf8").split("\n")) {
 		if (!line.trim()) continue;
@@ -229,10 +241,9 @@ function readSessionTail(file: string): { transcript: string; lastTs: number } |
 		if (!text) continue;
 		const ts = Date.parse(String(d.timestamp ?? ""));
 		if (Number.isFinite(ts) && ts > lastTs) lastTs = ts;
-		parts.push(`[${msg.role}] ${text.replace(/\s+/g, " ").slice(0, 3000)}`);
 	}
-	if (parts.length === 0 || lastTs <= 0) return null;
-	return { transcript: parts.join("\n\n").slice(0, ROLLOUT_CHAR_LIMIT), lastTs };
+	if (lastTs <= 0) return null;
+	return { lastTs };
 }
 
 /** Scan the sessions directory for other, idle-enough sessions (codex idle scan). */
@@ -244,6 +255,7 @@ function findIdleSessions(
 ): Array<{ file: string; lastTs: number }> {
 	const root = sessionsRoot();
 	const out: Array<{ file: string; lastTs: number }> = [];
+	const fileCandidates: Array<{ file: string; mtimeMs: number }> = [];
 	let dirs: string[] = [];
 	try {
 		dirs = fs.readdirSync(root);
@@ -268,16 +280,19 @@ function findIdleSessions(
 		for (const f of files) {
 			const full = path.join(dirPath, f);
 			if (currentFile && full === currentFile) continue; // exclude the active session
-			const tail = readSessionTail(full);
-			if (!tail) continue;
-			const idleMs = Date.now() - tail.lastTs;
-			if (idleMs >= minIdleMs && idleMs <= maxAgeMs) {
-				out.push({ file: full, lastTs: tail.lastTs });
-			}
-			if (out.length >= limit) return out;
+			try {
+				fileCandidates.push({ file: full, mtimeMs: fs.statSync(full).mtimeMs });
+			} catch { /* file disappeared during scan */ }
 		}
 	}
-	return out;
+	// Approximate Codex's indexed ORDER BY updated_at before parsing JSONL tails.
+	for (const candidate of fileCandidates.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, limit)) {
+		const tail = readSessionTail(candidate.file);
+		if (!tail) continue;
+		const idleMs = Date.now() - tail.lastTs;
+		if (idleMs >= minIdleMs && idleMs <= maxAgeMs) out.push({ file: candidate.file, lastTs: tail.lastTs });
+	}
+	return out.sort((a, b) => b.lastTs - a.lastTs);
 }
 
 // ---------------------------------------------------------------------------
@@ -307,7 +322,13 @@ function resolveExtractModel(ctxModel: unknown): { baseUrl: string; model: strin
 function startWorker(ctxModel: unknown): void {
 	if (worker) return;
 	const workerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "worker", "worker.cjs");
-	workerConfig = { dbPath: DB_PATH, memDir: MEMORY_DIR, pollMs: WORKER_POLL_MS, llm: resolveExtractModel(ctxModel) };
+	workerConfig = {
+		dbPath: DB_PATH,
+		memDir: MEMORY_DIR,
+		pollMs: WORKER_POLL_MS,
+		rolloutCharLimit: ROLLOUT_CHAR_LIMIT,
+		llm: resolveExtractModel(ctxModel),
+	};
 	worker = fork(workerPath, [], { stdio: ["ignore", "ignore", "inherit", "ipc"], execArgv: ["--no-warnings"] });
 	worker.send({ type: "config", config: workerConfig });
 	worker.on("exit", (code, signal) => {
@@ -344,6 +365,23 @@ function ensureLayout(): void {
 	if (!fs.existsSync(path.join(MEMORY_DIR, "raw_memories.md"))) {
 		fs.writeFileSync(path.join(MEMORY_DIR, "raw_memories.md"), "# Raw Memories\n\n");
 	}
+}
+
+function recordRolloutSummaryUsage(readPath: unknown): void {
+	if (typeof readPath !== "string") return;
+	const summariesDir = path.join(MEMORY_DIR, "rollout_summaries") + path.sep;
+	const resolved = path.resolve(readPath);
+	if (!resolved.startsWith(summariesDir) || !resolved.endsWith(".md")) return;
+	// Materialized filenames end in the first 8 chars of thread_id. UUID-prefix
+	// collisions are negligible; update only that cited rollout output.
+	const m = path.basename(resolved, ".md").match(/-([0-9a-f]{8})$/i);
+	if (!m) return;
+	const now = Date.now();
+	getDb().prepare(
+		`UPDATE stage1_outputs
+		 SET usage_count=COALESCE(usage_count, 0)+1, last_usage=?
+		 WHERE substr(thread_id, 1, 8)=?`,
+	).run(now, m[1]);
 }
 
 function buildRecallBlock(): string {
@@ -403,6 +441,13 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
+	// Codex records usage when a model cites a specific stage-1 memory. pi has
+	// no native citation item, so a read of a materialized rollout summary is
+	// the deterministic equivalent and drives retention/phase2 selection.
+	pi.on("tool_execution_start", async (event) => {
+		if (event.toolName === "read") recordRolloutSummaryUsage(event.args?.path);
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		// When running as a phase-2 consolidation agent (forked by the worker),
 		// never fork another worker — the child only edits the memory workspace.
@@ -426,17 +471,21 @@ export default function (pi: ExtensionAPI) {
 				// for them. The active session is excluded (it is the current one).
 				const candidates = findIdleSessions(currentFile, minIdleMs, maxAgeMs, SCAN_LIMIT);
 				let enqueued = 0;
+				// Like Codex max_rollouts_per_startup, bound actual new claims even
+				// when the historical scan sees thousands of candidate sessions.
+				// Skip already-completed/leased candidates without wasting a slot.
 				for (const c of candidates) {
+					if (enqueued >= MAX_ROLLOUTS_PER_STARTUP) break;
 					const tail = readSessionTail(c.file);
 					if (!tail) continue;
 					const threadId = path.basename(c.file).replace(/\.jsonl$/, "");
-					enqueueJobWithWatermark("phase1", threadId, tail.lastTs, {
-						transcript: tail.transcript,
+					const inserted = enqueueJobWithWatermark("phase1", threadId, tail.lastTs, {
+						// Worker reloads the full stable session at execution time, just
+						// like Codex loads rollout items after claiming the job.
 						rolloutPath: c.file,
-						rolloutCwd: path.dirname(c.file),
 						threadId,
 					});
-					enqueued++;
+					if (inserted) enqueued++;
 				}
 				if (enqueued > 0 && !worker) startWorker(ctx.model);
 			} catch {

@@ -60,14 +60,14 @@ Local markdown-file memory for pi, modeled after **Codex's memory system** (`cod
 - `rollout_summaries/<timestamp>-<slug>.md` — per-conversation distilled recaps
 - `skills/<name>/` — optional reusable procedures (`SKILL.md` packages)
 
-**Pipeline** (both phases are tool-less LLM sessions, exactly like Codex):
+**Pipeline** (modeled after Codex's memory startup pipeline):
 
-- **Phase 1** (per `agent_settled`, low reasoning): distills new conversation turns into `{raw_memory, rollout_summary, rollout_slug}` — with `Preference signals:` / `Reusable knowledge:` / `Failures and how to do differently:` sections — appended to `raw_memories.md` and `rollout_summaries/`. Sync state persists in the session file (no duplicate extraction across turns/resumes).
-- **Phase 2** (every N phase-1 runs, default 3, or `/memory consolidate`, medium reasoning): consolidates raw memories + existing artifacts + a git-style workspace diff into fresh `MEMORY.md` and `memory_summary.md`; drives incremental updates and forgetting (deleted rollout inputs → surgical memory cleanup).
+- **Phase 1** (on every settled turn, asynchronous): scans **other** session rollouts, excludes the active session, and selects sessions idle for `PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS` (default 6h) and younger than `PI_MEMORY_MAX_ROLLOUT_AGE_DAYS` (default 10d). The worker atomically claims at most `PI_MEMORY_MAX_ROLLOUTS_PER_STARTUP` (default 2), reloads the full stable JSONL rollout after claim, redacts secrets deterministically, and writes only `{raw_memory, rollout_summary, rollout_slug}` to SQLite. Watermarks + leases make duplicate scans harmless.
+- **Phase 2** (global singleton, cooldown/backoff, or `/memory consolidate`): selects recently cited outputs first (then recent uncited outputs), materializes `raw_memories.md` + `rollout_summaries/`, checks the git workspace diff, then runs a restricted consolidation child (`read/grep/edit/write` only; no extensions, skills, shell, or network tools) to update `MEMORY.md` and `memory_summary.md`. Old unused outputs are pruned after `PI_MEMORY_MAX_UNUSED_DAYS` (default 30d).
 
 **Recall** (every `before_agent_start`): `memory_summary.md` is injected into the system prompt with a decision boundary ("skip memory only when clearly self-contained") and a lightweight quick-pass (≤4–6 search steps), mirroring Codex's `read_path.md`.
 
-Config (env): `PI_MEMORY_DIR`, `PI_MEMORY_AUTO=0` (disable phase 1), `PI_MEMORY_RECALL=0` (disable injection), `PI_MEMORY_CONSOLIDATE_EVERY`, `PI_MEMORY_SUMMARY_TOKENS`, `PI_MEMORY_ROLLOUT_CHARS`, `PI_MEMORY_MEMORY_CHARS`.
+Config (env): `PI_MEMORY_DIR`, `PI_MEMORY_DB`, `PI_MEMORY_AUTO=0` (disable phase 1), `PI_MEMORY_RECALL=0` (disable injection), `PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS` (default 6), `PI_MEMORY_MAX_ROLLOUT_AGE_DAYS` (default 10), `PI_MEMORY_SCAN_LIMIT` (default 5000), `PI_MEMORY_MAX_ROLLOUTS_PER_STARTUP` (default 2), `PI_MEMORY_PHASE1_CONCURRENCY` (default 8), `PI_MEMORY_MAX_UNUSED_DAYS` (default 30), `PI_MEMORY_MAX_RAW_CONSOLIDATION` (default 256), `PI_MEMORY_SUMMARY_TOKENS`, `PI_MEMORY_ROLLOUT_CHARS`.
 
 ## Install
 

@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS stage1_outputs (
     source_updated_at INTEGER NOT NULL,
     raw_memory TEXT NOT NULL,
     rollout_summary TEXT NOT NULL,
+    generated_at INTEGER,
     rollout_slug TEXT,
     cwd TEXT,
     git_branch TEXT,
@@ -104,6 +105,94 @@ function parseJsonObj(final) {
 	} catch {
 		return null;
 	}
+}
+
+/** Best-effort JSON repair for LLM output (jsonrepair-lite). */
+function redactSecrets(text) {
+	let redacted = String(text ?? "");
+	// Known high-risk token formats first.
+	redacted = redacted.replace(/\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{16,}|ark-[A-Za-z0-9_-]{16,})\b/g, "[REDACTED_SECRET]");
+	// Authorization headers and URLs with inline credentials.
+	redacted = redacted.replace(/(authorization\s*:\s*bearer\s+)[^\s"']+/gi, "$1[REDACTED_SECRET]");
+	redacted = redacted.replace(/(https?:\/\/)[^\s/:@]+:[^\s@/]+@/gi, "$1[REDACTED_SECRET]@");
+	// Common credential assignments. Deliberately excludes generic "token" so
+	// harmless values such as token_budget are preserved.
+	redacted = redacted.replace(
+		/((?:api[_-]?key|secret|password|access[_-]?key|github[_-]?token|ark[_-]?api[_-]?keys?)\s*[:=]\s*["']?)[^\s,"'\n}]+/gi,
+		"$1[REDACTED_SECRET]",
+	);
+	return redacted;
+}
+
+/** Parse a full pi JSONL session into an LLM-safe transcript. */
+function sessionTranscriptFromJsonl(jsonl, maxChars) {
+	const parts = [];
+	let lastTs = 0;
+	let cwd = "";
+	let sessionId = "";
+	for (const line of String(jsonl ?? "").split("\n")) {
+		if (!line.trim()) continue;
+		let entry;
+		try { entry = JSON.parse(line); } catch { continue; }
+		if (entry.type === "session") {
+			if (typeof entry.cwd === "string") cwd = entry.cwd;
+			if (typeof entry.id === "string") sessionId = entry.id;
+		}
+		if (entry.type !== "message" || !entry.message) continue;
+		const msg = entry.message;
+		if (msg.role !== "user" && msg.role !== "assistant") continue;
+		const content = msg.content;
+		const textParts = Array.isArray(content)
+			? content
+			: typeof content === "string" ? [{ type: "text", text: content }] : [];
+		const text = textParts
+			.filter((p) => p?.type === "text" && typeof p.text === "string")
+			.map((p) => p.text)
+			.join(" ")
+			.trim();
+		if (!text) continue;
+		const ts = Date.parse(String(entry.timestamp ?? ""));
+		if (Number.isFinite(ts) && ts > lastTs) lastTs = ts;
+		parts.push(`[${msg.role}] ${text.replace(/\s+/g, " ").slice(0, 3000)}`);
+	}
+	const full = parts.join("\n\n");
+	const limit = Math.max(1, Number(maxChars) || full.length);
+	// Preserve both the original problem framing and recent decisions when a
+	// rollout exceeds the model-input budget.
+	const transcript = full.length <= limit
+		? full
+		: `${full.slice(0, Math.floor(limit * 0.4))}\n\n[... rollout middle omitted for input budget ...]\n\n${full.slice(-(limit - Math.floor(limit * 0.4)) )}`;
+	return { transcript, lastTs, cwd, sessionId };
+}
+
+/**
+ * Atomically enqueue a newer phase-1 input without overwriting an active
+ * lease. A duplicate scan is harmless; a leased/running job keeps ownership
+ * until the worker completes or its lease expires.
+ */
+function upsertPhase1Job(db, jobKey, inputWatermark, payload, now = Date.now()) {
+	const result = db.prepare(
+		`INSERT INTO jobs (kind, job_key, status, retry_remaining, payload, input_watermark, created_at)
+		 VALUES ('phase1', ?, 'pending', 3, ?, ?, ?)
+		 ON CONFLICT(kind, job_key) DO UPDATE SET
+		   status='pending', retry_remaining=3, payload=excluded.payload,
+		   input_watermark=excluded.input_watermark, created_at=excluded.created_at,
+		   worker_id=NULL, ownership_token=NULL, lease_until=NULL,
+		   retry_until=NULL, last_error=NULL, finished_at=NULL
+		 WHERE jobs.status IN ('pending','failed','completed')
+		   AND (
+		     COALESCE(excluded.input_watermark, 0) > COALESCE(jobs.input_watermark, 0)
+		     -- Retention may prune the stage1 row while the source rollout still
+		     -- exists. Codex stage1_source_needs_update treats that as eligible
+		     -- again even if the rollout watermark itself has not changed.
+		     OR (jobs.status='completed' AND NOT EXISTS (
+		       SELECT 1 FROM stage1_outputs AS so
+		       WHERE so.thread_id=jobs.job_key
+		         AND so.source_updated_at >= COALESCE(jobs.input_watermark, 0)
+		     ))
+		   )`,
+	).run(jobKey, JSON.stringify(payload), inputWatermark, now);
+	return result.changes > 0;
 }
 
 /** Best-effort JSON repair for LLM output (jsonrepair-lite). */
@@ -195,4 +284,13 @@ async function completeLLM(config, prompt, signal) {
 	return text.trim();
 }
 
-module.exports = { SCHEMA, phase1Prompt, completeLLM, parseJsonObj, repairJsonText };
+module.exports = {
+	SCHEMA,
+	phase1Prompt,
+	completeLLM,
+	parseJsonObj,
+	repairJsonText,
+	redactSecrets,
+	sessionTranscriptFromJsonl,
+	upsertPhase1Job,
+};
