@@ -8,9 +8,9 @@
  *   3. Global         ~/.pi/agent/.env     (shared secrets/config)
  *
  * The file is parsed at module load time — before later extensions in the
- * packages list are imported — so extensions that read env vars at module
- * scope (e.g. pi-openviking-memory's OPENVIKING_SERVER_URL) pick the values up.
- * Keep this package FIRST in settings.json's packages list.
+ * packages list are imported — so extensions that read environment variables
+ * at module scope pick the values up. Keep this package FIRST in settings.json's
+ * packages list.
  *
  * Format: KEY=VALUE per line. Supports `export KEY=VALUE`, `#` comments,
  * blank lines, and single/double-quoted values.
