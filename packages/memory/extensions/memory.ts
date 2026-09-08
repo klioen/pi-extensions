@@ -508,9 +508,31 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("memory", {
-		description: "pi-memory: /memory (status) | /memory consolidate | /memory path | /memory reset",
+		description: "pi-memory: /memory (status) | consolidate | path | log [lines] | reset",
 		handler: async (args, ctx) => {
-			const sub = (args || "").trim().split(/\s+/)[0];
+			const parts = (args || "").trim().split(/\s+/).filter(Boolean);
+			const sub = parts[0];
+			if (sub === "log") {
+				// Read only the tail: worker.log is append-only and may grow large.
+				// Deliberately bounded so an explicit diagnostic view cannot consume the
+				// whole TUI footer that the worker's live stderr used to consume.
+				const requested = Number(parts[1]);
+				const lines = Number.isFinite(requested) ? Math.min(100, Math.max(1, Math.floor(requested))) : 20;
+				try {
+					const stat = fs.statSync(WORKER_LOG_PATH);
+					const start = Math.max(0, stat.size - 32 * 1024);
+					const fd = fs.openSync(WORKER_LOG_PATH, "r");
+					const data = Buffer.alloc(stat.size - start);
+					fs.readSync(fd, data, 0, data.length, start);
+					fs.closeSync(fd);
+					const tail = data.toString("utf8").trim().split(/\r?\n/).slice(-lines).join("\n");
+					ctx.ui.notify(tail ? `pi-memory worker log (last ${lines} lines):\n${tail}` : "pi-memory: worker log is empty.", "info");
+				} catch (error) {
+					const code = (error as NodeJS.ErrnoException).code;
+					ctx.ui.notify(code === "ENOENT" ? "pi-memory: no worker log yet." : `pi-memory: could not read worker log: ${String(error)}`, "warning");
+				}
+				return;
+			}
 			if (sub === "path") {
 				ctx.ui.notify(`Memory dir: ${MEMORY_DIR}\nDB: ${DB_PATH}\nWorker log: ${WORKER_LOG_PATH}`, "info");
 				return;
