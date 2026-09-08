@@ -230,7 +230,7 @@ function readSessionTail(file: string): { lastTs: number } | null {
 		}
 		if (d.type !== "message" || !d.message) continue;
 		const msg = d.message;
-		if (msg.role !== "user" && msg.role !== "assistant") continue;
+		if (msg.role !== "user" && msg.role !== "assistant" && msg.role !== "toolResult") continue;
 		const content = msg.content;
 		const textParts = (Array.isArray(content) ? content : typeof content === "string" ? [{ type: "text", text: content }] : []) as Array<{ type: string; text?: string }>;
 		const text = textParts
@@ -238,7 +238,10 @@ function readSessionTail(file: string): { lastTs: number } | null {
 			.map((p) => p.text as string)
 			.join(" ")
 			.trim();
-		if (!text) continue;
+		// An assistant tool call is activity too, even though its content has no
+		// text until the paired toolResult arrives.
+		const hasToolCall = msg.role === "assistant" && textParts.some((p) => p.type === "toolCall");
+		if (!text && !hasToolCall) continue;
 		const ts = Date.parse(String(d.timestamp ?? ""));
 		if (Number.isFinite(ts) && ts > lastTs) lastTs = ts;
 	}

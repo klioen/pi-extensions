@@ -115,6 +115,11 @@ function redactSecrets(text) {
 	// Authorization headers and URLs with inline credentials.
 	redacted = redacted.replace(/(authorization\s*:\s*bearer\s+)[^\s"']+/gi, "$1[REDACTED_SECRET]");
 	redacted = redacted.replace(/(https?:\/\/)[^\s/:@]+:[^\s@/]+@/gi, "$1[REDACTED_SECRET]@");
+	// JSON credential fields first (tool-call arguments are JSON.stringify'd).
+	redacted = redacted.replace(
+		/("(?:api[_-]?key|secret|password|access[_-]?key|github[_-]?token|ark[_-]?api[_-]?keys?)"\s*:\s*")[^"]*(")/gi,
+		"$1[REDACTED_SECRET]$2",
+	);
 	// Common credential assignments. Deliberately excludes generic "token" so
 	// harmless values such as token_budget are preserved.
 	redacted = redacted.replace(
@@ -140,20 +145,28 @@ function sessionTranscriptFromJsonl(jsonl, maxChars) {
 		}
 		if (entry.type !== "message" || !entry.message) continue;
 		const msg = entry.message;
-		if (msg.role !== "user" && msg.role !== "assistant") continue;
+		if (msg.role !== "user" && msg.role !== "assistant" && msg.role !== "toolResult") continue;
 		const content = msg.content;
-		const textParts = Array.isArray(content)
+		const items = Array.isArray(content)
 			? content
 			: typeof content === "string" ? [{ type: "text", text: content }] : [];
-		const text = textParts
-			.filter((p) => p?.type === "text" && typeof p.text === "string")
-			.map((p) => p.text)
-			.join(" ")
-			.trim();
-		if (!text) continue;
+		const rendered = [];
+		for (const item of items) {
+			if (item?.type === "text" && typeof item.text === "string") {
+				rendered.push(`[${msg.role}] ${redactSecrets(item.text.replace(/\s+/g, " ")).slice(0, 3000)}`);
+			} else if (msg.role === "assistant" && item?.type === "toolCall") {
+				// Preserve the action and arguments, but never model reasoning. This
+				// mirrors Codex's filtered rollout items: tool behavior is useful for
+				// durable lessons, while raw thought is not a memory source.
+				let args = "{}";
+				try { args = JSON.stringify(item.arguments ?? {}); } catch { args = "[unserializable arguments]"; }
+				rendered.push(`[assistant tool_call:${item.name || "unknown"}] ${redactSecrets(args).slice(0, 3000)}`);
+			}
+		}
+		if (rendered.length === 0) continue;
 		const ts = Date.parse(String(entry.timestamp ?? ""));
 		if (Number.isFinite(ts) && ts > lastTs) lastTs = ts;
-		parts.push(`[${msg.role}] ${text.replace(/\s+/g, " ").slice(0, 3000)}`);
+		parts.push(...rendered);
 	}
 	const full = parts.join("\n\n");
 	const limit = Math.max(1, Number(maxChars) || full.length);

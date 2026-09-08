@@ -97,6 +97,27 @@ test("sessionTranscriptFromJsonl reads full session and preserves head plus tail
 });
 
 // --- P0: duplicate scans must never reset a leased job / ownership token ---
+test("sessionTranscriptFromJsonl preserves tool calls/results but excludes thinking", () => {
+	const jsonl = [
+		JSON.stringify({ type: "session", cwd: "/project" }),
+		JSON.stringify({ type: "message", timestamp: "2026-01-01T00:00:00.000Z", message: {
+			role: "assistant", content: [
+				{ type: "thinking", thinking: "private chain of thought" },
+				{ type: "toolCall", name: "bash", arguments: { command: "git status", api_key: "super-secret" } },
+			],
+		} }),
+		JSON.stringify({ type: "message", timestamp: "2026-01-01T00:01:00.000Z", message: {
+			role: "toolResult", toolName: "bash", content: [{ type: "text", text: "M src/index.ts" }],
+		} }),
+	].join("\n");
+	const parsed = sessionTranscriptFromJsonl(jsonl, 10_000);
+	assert.match(parsed.transcript, /tool_call:bash/);
+	assert.match(parsed.transcript, /git status/);
+	assert.match(parsed.transcript, /\[toolResult\] M src\/index\.ts/);
+	assert.doesNotMatch(parsed.transcript, /private chain of thought|super-secret/);
+	assert.match(parsed.transcript, /\[REDACTED_SECRET\]/);
+});
+
 test("upsertPhase1Job never overwrites an active lease", () => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-memory-test-"));
 	const db = new DatabaseSync(join(dir, "memory.db"));
