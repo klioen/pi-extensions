@@ -1,32 +1,31 @@
-# Plan: 为 pi-sdlc 增加 Codex 对齐的 `/init`（approved 2026-09-08）
+# Plan: 为 pi-sdlc 增加只读协作 `/plan`（approved 2026-09-08）
 
 ## Files that change
-- 新增 `packages/sdlc/extensions/init.ts`：注册 `/init`，将项目感知的初始化任务交给当前 pi agent。
-- 新增 `packages/sdlc/lib/init-core.cjs`：参数解析、AGENTS.md 状态判断与初始化 prompt 构建。
-- 修改 `packages/sdlc/package.json`：同时暴露 `extensions` 与既有 `skills`。
-- 新增 `tests/sdlc-init-core.test.mjs`：覆盖参数、保留既有指令和 prompt 护栏。
-- 更新 `AGENTS.md`：记录 pi-sdlc extension 结构与 `/init` 验证方式。
+- 新增 `packages/sdlc/extensions/plan.ts`：纯只读 `/plan [off|status]` 模式、工具限制、session 持久化与状态栏。
+- 新增 `packages/sdlc/lib/plan-core.cjs` 与 `.d.cts`：参数、严格只读 bash allowlist、计划提示词和状态归一化。
+- 新增 `tests/sdlc-plan-core.test.mjs`：覆盖参数、shell 拦截和提示词护栏。
+- 更新 `AGENTS.md`：记录隔离验证要求。
 
 ## Order of work
-1. 提交本计划，形成用户批准的审计链。
-2. 实现并测试纯 core 逻辑。
-3. 实现 extension command，调用当前 agent 完成只读勘察和 AGENTS.md 创建/更新。
-4. 注册 package extension，补充项目约定。
-5. 跑完整单测、TypeScript 检查及隔离手工验证。
+1. 提交本计划，形成审批审计链。
+2. 实现并测试纯 core 的参数、命令安全和提示词逻辑。
+3. 实现 extension：禁用写工具、二次拦截 bash、注入规划指令、持久化/恢复状态。
+4. 执行完整测试、TypeScript 检查与 pi RPC command discovery。
 
 ## Behavior
-- `/init`：若根 `AGENTS.md` 不存在则创建；存在则保留人工规则并增量更新。
-- `/init --force`：允许基于实际勘察重写根 `AGENTS.md`。
-- 不生成或修改 `CLAUDE.md`；不编造项目命令或规则。
-- 无已选模型时显示清晰错误；不假装已完成。
+- `/plan` 进入只读协作规划模式；`/plan off` 退出并恢复进入前工具集；`/plan status` 显示状态。
+- 只允许 `read`、`grep`、`find`、`ls`、`bash`；bash 只能运行单段 allowlist 中的只读检查命令。
+- 只输出可审核方案，不创建 `plan.md`、不修改项目文件、不提供自动执行或 todo 完成追踪。
+- 退出 plan mode 不构成对任何实施计划的批准。
 
 ## Risks
-- 最大风险是静态模板编造项目命令；因此命令只构造严格任务，要求当前 agent 先只读勘察再落盘。
-- 已有 `AGENTS.md` 的人工内容可能被覆盖；默认更新模式明确要求保留，只有 `--force` 可重写。
-- 不采用 extension 自行扫描/写静态内容：这种方案无法对齐 Codex 的项目感知 `/init`。
+- 仅靠 system prompt 不能阻止写入；因此采取 active-tool allowlist + `tool_call` shell/write 二次拦截。
+- 宽松 bash 正则会被 `;`、重定向、管道或命令替换绕过；core 默认拒绝且拒绝 shell 控制/组合语法。
+- 用户手工 `!command` 不属 agent tool call，不由此模式拦截。
 
 ## Proof
 - `npm test`
 - `git diff --check`
 - TypeScript 编译
-- 隔离项目中手动运行 `/init`，检查创建内容和既有规则保留行为。
+- pi RPC command discovery 出现 `/plan`
+- 隔离会话验证 plan mode 工具集与写 shell 拒绝行为。
