@@ -1,60 +1,10 @@
 "use strict";
-
-const PLAN_TOOLS = ["read", "grep", "find", "ls", "bash"];
-const SHELL_CONTROL = /[|;&><`\n\r]|\$\(|\$\{/;
-
-function parsePlanArgs(input = "") {
-	const tokens = String(input).trim().split(/\s+/).filter(Boolean);
-	if (tokens.length === 0) return { action: "on" };
-	if (tokens.length === 1 && tokens[0] === "off") return { action: "off" };
-	if (tokens.length === 1 && tokens[0] === "status") return { action: "status" };
-	return { error: "usage: /plan [off|status]" };
-}
-
-function tokens(command) {
-	return command.trim().split(/\s+/).filter(Boolean);
-}
-
-function isReadOnlyBashCommand(command) {
-	if (typeof command !== "string" || !command.trim() || SHELL_CONTROL.test(command)) return false;
-	const parts = tokens(command);
-	const [program, ...args] = parts;
-	if (!program) return false;
-
-	if (["cat", "head", "tail", "wc", "stat", "file", "pwd", "ls", "find", "rg", "grep", "diff", "du"].includes(program)) return true;
-	if (program === "sed") return args[0] === "-n";
-	if (program === "node") return args.length === 1 && args[0] === "--version";
-	if (program === "git") {
-		const subcommand = args[0];
-		if (["status", "log", "diff", "show", "branch", "remote", "ls-files"].includes(subcommand)) return true;
-		return subcommand === "config" && (args[1] === "--get" || args[1] === "--get-regexp");
-	}
-	if (program === "npm") return (args.length === 1 && args[0] === "--version") || ["list", "ls", "view", "info", "outdated", "audit"].includes(args[0]);
-	return false;
-}
-
-function normalizePlanState(value) {
-	if (!value || typeof value !== "object") return { enabled: false, toolsBeforePlanMode: undefined };
-	const tools = Array.isArray(value.toolsBeforePlanMode) && value.toolsBeforePlanMode.every((x) => typeof x === "string")
-		? [...new Set(value.toolsBeforePlanMode)]
-		: undefined;
-	return { enabled: value.enabled === true, toolsBeforePlanMode: tools };
-}
-
-function buildPlanPrompt() {
-	return `You are in PLAN MODE: collaborate on a plan, but do not execute it.
-
-You may inspect the repository using only read-only tools. First gather evidence, then ask concise clarifying questions when needed. Do not modify files. Do not create plan.md. Do not install dependencies, run tests, start services, make network requests, commit, push, or otherwise execute the proposed work.
-
-Return a reviewable plan with exactly these sections when applicable:
-1. Understanding and evidence
-2. Scope and files likely to change
-3. Proposed implementation steps
-4. Risks, alternatives, and decision points
-5. Verification approach
-6. Open questions
-
-Treat the plan as a proposal only. Leaving plan mode, a user acknowledgement, or continued conversation does not constitute approval to implement. Implementation still requires the repository's documented planning and explicit-approval workflow.`;
-}
-
-module.exports = { PLAN_TOOLS, parsePlanArgs, isReadOnlyBashCommand, normalizePlanState, buildPlanPrompt };
+const PLAN_TOOLS=["read","grep","find","ls","bash"];
+const SHELL_CONTROL=/[|;&><`\n\r]|\$\(|\$\{/;
+const STATUSES=new Set(["pending","in_progress","completed","blocked"]);
+function parsePlanArgs(input=""){const t=String(input).trim().split(/\s+/).filter(Boolean);if(!t.length)return{action:"on"};if(t.length===1&&["off","status"].includes(t[0]))return{action:t[0]};return{error:"usage: /plan [off|status]"};}
+function isReadOnlyBashCommand(c){if(typeof c!=="string"||!c.trim()||SHELL_CONTROL.test(c))return false;const[a,...x]=c.trim().split(/\s+/);if(["cat","head","tail","wc","stat","file","pwd","ls","find","rg","grep","diff","du"].includes(a))return true;if(a==="sed")return x[0]==="-n";if(a==="node")return x.length===1&&x[0]==="--version";if(a==="git"){if(["status","log","diff","show","branch","remote","ls-files"].includes(x[0]))return true;return x[0]==="config"&&["--get","--get-regexp"].includes(x[1]);}return a==="npm"&&((x.length===1&&x[0]==="--version")||["list","ls","view","info","outdated","audit"].includes(x[0]));}
+function normalizePlanState(v){if(!v||typeof v!=="object")return{enabled:false,toolsBeforePlanMode:undefined,plan:[]};const tools=Array.isArray(v.toolsBeforePlanMode)&&v.toolsBeforePlanMode.every(x=>typeof x==="string")?[...new Set(v.toolsBeforePlanMode)]:undefined;const plan=Array.isArray(v.plan)?v.plan.filter(s=>s&&typeof s.id==="string"&&typeof s.step==="string"&&STATUSES.has(s.status)).slice(0,20):[];return{enabled:v.enabled===true,toolsBeforePlanMode:tools,plan,explanation:typeof v.explanation==="string"?v.explanation:undefined};}
+function validatePlan(plan,explanation,previous=[]){if(!Array.isArray(plan)||!plan.length||plan.length>20)throw Error("plan must contain 1-20 steps");const ids=new Set(),active=plan.filter(s=>s.status==="in_progress");if(active.length>1)throw Error("only one step may be in_progress");for(const s of plan){if(!s||typeof s.id!=="string"||!s.id.trim()||typeof s.step!=="string"||!s.step.trim()||!STATUSES.has(s.status)||ids.has(s.id))throw Error("each step needs a unique id, text, and valid status");ids.add(s.id);if(s.status==="blocked"&&!explanation?.trim())throw Error("blocked plans require an explanation");}const next=plan.map(s=>({id:s.id.trim(),step:s.step.trim(),status:s.status}));const nextById=new Map(next.map(s=>[s.id,s]));for(const old of Array.isArray(previous)?previous:[]){if(old?.status!=="completed")continue;const replacement=nextById.get(old.id);if((!replacement||replacement.status!=="completed")&&!explanation?.trim())throw Error("completed steps require an explanation before changing or removing them");}return next;}
+function buildPlanPrompt(){return "You are in PLAN MODE: collaborate on a plan, but do not execute it. Use update_plan only when the evidence-based proposal materially changes. A plan update is not implementation approval.";}
+module.exports={PLAN_TOOLS,parsePlanArgs,isReadOnlyBashCommand,normalizePlanState,validatePlan,buildPlanPrompt};
