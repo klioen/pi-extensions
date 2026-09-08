@@ -50,6 +50,8 @@ const SUMMARY_TOKEN_LIMIT = Math.max(500, Number(process.env.PI_MEMORY_SUMMARY_T
 const ROLLOUT_CHAR_LIMIT = Math.max(4000, Number(process.env.PI_MEMORY_ROLLOUT_CHARS) || 20000);
 const EXTRACT_MODEL = process.env.PI_MEMORY_EXTRACT_MODEL || ""; // optional override, like codex extract_model
 const MIN_ROLLOUT_IDLE_HOURS = process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS === undefined ? 6 : Math.max(0, Number(process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS)); // codex default 6h; explicit 0 disables
+const MAX_ROLLOUT_AGE_DAYS = Math.max(1, Number(process.env.PI_MEMORY_MAX_ROLLOUT_AGE_DAYS) || 30); // codex max_rollout_age_days
+const SCAN_LIMIT = Math.max(1, Number(process.env.PI_MEMORY_SCAN_LIMIT) || 20); // codex THREAD_SCAN_LIMIT
 const WORKER_POLL_MS = Math.max(500, Number(process.env.PI_MEMORY_WORKER_POLL_MS) || 3000);
 
 // DB state keys
@@ -162,6 +164,118 @@ function collectMessages(sm: { getEntries: () => unknown[]; getLeafId: () => str
 		if (!text) continue;
 		const ts = Date.parse((entry as { timestamp?: string }).timestamp ?? "");
 		out.push({ entryId: entry.id, ts: Number.isFinite(ts) ? ts : 0, role: message.role, content: text });
+	}
+	return out;
+}
+
+// ---------------------------------------------------------------------------
+// Idle-session scan (codex claim_stage1_jobs_for_startup)
+//
+// Codex never checks whether the CURRENT thread is idle — on every new turn
+// it SQL-scans the threads table for OTHER threads whose updated_at is at
+// least min_rollout_idle_hours ago and enqueues phase-1 extraction for them.
+// pi analog: scan the sessions directory for other session files whose last
+// message is at least MIN_ROLLOUT_IDLE_HOURS old. Watermark idempotency
+// (stage1_outputs.source_updated_at >= input_watermark) is enforced by the
+// worker, so re-scans are harmless.
+// ---------------------------------------------------------------------------
+
+function sessionsRoot(): string {
+	return process.env.PI_SESSION_DIR || path.join(os.homedir(), ".pi", "agent", "sessions");
+}
+
+/**
+ * Read the tail of a session file, returning the transcript (latest messages)
+ * and the timestamp of the last user/assistant message. Reads only the tail
+ * (up to 512KB) so the scan is cheap even for long sessions.
+ */
+function readSessionTail(file: string): { transcript: string; lastTs: number } | null {
+	let size: number;
+	try {
+		size = fs.statSync(file).size;
+	} catch {
+		return null;
+	}
+	if (size === 0) return null;
+	const tailBytes = Math.min(size, 512 * 1024);
+	const buf = Buffer.alloc(tailBytes);
+	try {
+		const fd = fs.openSync(file, "r");
+		fs.readSync(fd, buf, 0, tailBytes, size - tailBytes);
+		fs.closeSync(fd);
+	} catch {
+		return null;
+	}
+	const parts: string[] = [];
+	let lastTs = 0;
+	for (const line of buf.toString("utf8").split("\n")) {
+		if (!line.trim()) continue;
+		let d: { type?: string; timestamp?: string; message?: { role?: string; content?: unknown } };
+		try {
+			d = JSON.parse(line);
+		} catch {
+			continue; // possibly a truncated first line at the tail boundary
+		}
+		if (d.type !== "message" || !d.message) continue;
+		const msg = d.message;
+		if (msg.role !== "user" && msg.role !== "assistant") continue;
+		const content = msg.content;
+		const textParts = (Array.isArray(content) ? content : typeof content === "string" ? [{ type: "text", text: content }] : []) as Array<{ type: string; text?: string }>;
+		const text = textParts
+			.filter((p) => p.type === "text" && typeof p.text === "string")
+			.map((p) => p.text as string)
+			.join(" ")
+			.trim();
+		if (!text) continue;
+		const ts = Date.parse(String(d.timestamp ?? ""));
+		if (Number.isFinite(ts) && ts > lastTs) lastTs = ts;
+		parts.push(`[${msg.role}] ${text.replace(/\s+/g, " ").slice(0, 3000)}`);
+	}
+	if (parts.length === 0 || lastTs <= 0) return null;
+	return { transcript: parts.join("\n\n").slice(0, ROLLOUT_CHAR_LIMIT), lastTs };
+}
+
+/** Scan the sessions directory for other, idle-enough sessions (codex idle scan). */
+function findIdleSessions(
+	currentFile: string | undefined,
+	minIdleMs: number,
+	maxAgeMs: number,
+	limit: number,
+): Array<{ file: string; lastTs: number }> {
+	const root = sessionsRoot();
+	const out: Array<{ file: string; lastTs: number }> = [];
+	let dirs: string[] = [];
+	try {
+		dirs = fs.readdirSync(root);
+	} catch {
+		return out;
+	}
+	for (const dir of dirs) {
+		const dirPath = path.join(root, dir);
+		let st: fs.Stats;
+		try {
+			st = fs.statSync(dirPath);
+		} catch {
+			continue;
+		}
+		if (!st.isDirectory()) continue;
+		let files: string[] = [];
+		try {
+			files = fs.readdirSync(dirPath).filter((f) => f.endsWith(".jsonl"));
+		} catch {
+			continue;
+		}
+		for (const f of files) {
+			const full = path.join(dirPath, f);
+			if (currentFile && full === currentFile) continue; // exclude the active session
+			const tail = readSessionTail(full);
+			if (!tail) continue;
+			const idleMs = Date.now() - tail.lastTs;
+			if (idleMs >= minIdleMs && idleMs <= maxAgeMs) {
+				out.push({ file: full, lastTs: tail.lastTs });
+			}
+			if (out.length >= limit) return out;
+		}
 	}
 	return out;
 }
@@ -304,53 +418,27 @@ export default function (pi: ExtensionAPI) {
 		pi.on("agent_settled", async (_event, ctx) => {
 			try {
 				const sm = ctx.sessionManager;
-				const msgs = collectMessages(sm);
-				if (msgs.length === 0) return;
-				const state = readState<{ lastExtractedId: string | null; phase1Count: number }>(DB_STATE_KEY, {
-					lastExtractedId: null,
-					phase1Count: 0,
-				});
-				const lastIdx = state.lastExtractedId ? msgs.findIndex((m) => m.entryId === state.lastExtractedId) : -1;
-				const fresh = msgs.slice(lastIdx + 1);
-				if (fresh.length === 0) return;
-
-				const transcript = fresh
-					.map((m) => `[${m.role}] ${m.content.replace(/\s+/g, " ").slice(0, 3000)}`)
-					.join("\n\n")
-					.slice(0, ROLLOUT_CHAR_LIMIT);
-				if (!transcript.trim()) return;
-
-				const threadId = String(sm.getSessionId?.() ?? "pi");
-				const phase1Count = state.phase1Count + 1;
-
-				// Codex min_rollout_idle_hours: only extract after the conversation
-				// has been idle for N hours. Default 0 = extract immediately after
-				// each turn, which is the pi analog of a completed rollout.
-				if (MIN_ROLLOUT_IDLE_HOURS > 0) {
-					const lastTs = fresh[fresh.length - 1].ts || 0;
-					if (lastTs > 0 && Date.now() - lastTs < MIN_ROLLOUT_IDLE_HOURS * 3600_000) {
-						// conversation still fresh; skip phase-1 this turn
-						return;
-					}
+				const currentFile = sm.getSessionFile?.();
+				const minIdleMs = MIN_ROLLOUT_IDLE_HOURS * 3600_000;
+				const maxAgeMs = MAX_ROLLOUT_AGE_DAYS * 24 * 3600_000;
+				// Codex claim_stage1_jobs_for_startup: scan OTHER sessions whose last
+				// activity is at least min_rollout_idle_hours ago and enqueue phase-1
+				// for them. The active session is excluded (it is the current one).
+				const candidates = findIdleSessions(currentFile, minIdleMs, maxAgeMs, SCAN_LIMIT);
+				let enqueued = 0;
+				for (const c of candidates) {
+					const tail = readSessionTail(c.file);
+					if (!tail) continue;
+					const threadId = path.basename(c.file).replace(/\.jsonl$/, "");
+					enqueueJobWithWatermark("phase1", threadId, tail.lastTs, {
+						transcript: tail.transcript,
+						rolloutPath: c.file,
+						rolloutCwd: path.dirname(c.file),
+						threadId,
+					});
+					enqueued++;
 				}
-
-				// Enqueue a phase-1 job with the input watermark set to the latest
-				// message timestamp. The worker claims and executes asynchronously;
-				// Codex-aligned idempotency (stage1_outputs.source_updated_at >=
-				// input_watermark) lets a retried/duplicate job skip harmlessly.
-				// Phase-2 consolidation is triggered by the worker itself after a
-				// phase-1 success (watermark advance), gated by cooldown/backoff —
-				// exactly like Codex's global phase-2 singleton job.
-				const inputWatermark = fresh[fresh.length - 1].ts || 0;
-				enqueueJobWithWatermark("phase1", threadId, inputWatermark, {
-					transcript,
-					rolloutPath: String(sm.getSessionFile?.() ?? ""),
-					rolloutCwd: ctx.cwd,
-					threadId,
-				});
-				upsertState(DB_STATE_KEY, { lastExtractedId: msgs[msgs.length - 1].entryId, phase1Count });
-
-				if (!worker) startWorker(ctx.model);
+				if (enqueued > 0 && !worker) startWorker(ctx.model);
 			} catch {
 				/* never break the session */
 			}
