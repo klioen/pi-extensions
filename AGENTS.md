@@ -26,6 +26,7 @@ Custom pi coding-agent packages. Root `package.json` exposes the umbrella runtim
 - Run all tests: `npm test`.
 - For extension changes, reload or restart pi before manual verification.
 - Test `/init` in an isolated temporary project: it must create/update only that project's `AGENTS.md` from repository evidence.
+- Test `/plan` in an isolated temporary project: agent `edit`/`write` and non-allowlisted shell commands must be blocked; `/plan off` restores the earlier tool set and creates no project file.
 - Never commit credentials, absolute user paths, API keys, or personal data.
 
 ## Conventions

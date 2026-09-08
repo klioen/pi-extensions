@@ -1,0 +1,8 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { buildPlanPrompt, isReadOnlyBashCommand, normalizePlanState, parsePlanArgs } from "../packages/sdlc/lib/plan-core.cjs";
+test("plan args",()=>{assert.deepEqual(parsePlanArgs(""),{action:"on"});assert.deepEqual(parsePlanArgs("off"),{action:"off"});assert.deepEqual(parsePlanArgs("status"),{action:"status"});assert.equal(parsePlanArgs("on").error,"usage: /plan [off|status]");});
+test("allowlists bounded inspection",()=>{for(const x of ["pwd","ls -la src","rg -n TODO .","find packages -name package.json","sed -n 1,80p package.json","git status --short","git diff --cached","npm audit","npm --version","node --version"])assert.equal(isReadOnlyBashCommand(x),true,x);});
+test("rejects writes and shell composition",()=>{for(const x of ["rm -rf /tmp/x","git commit -m x","npm install","npm test","echo hi > x","git status; rm -rf x","rg TODO | tee result","$(rm -rf x)","curl https://example.com","mkdir x"])assert.equal(isReadOnlyBashCommand(x),false,x);});
+test("normalizes persisted state",()=>{assert.deepEqual(normalizePlanState({enabled:true,toolsBeforePlanMode:["read","bash","read"]}),{enabled:true,toolsBeforePlanMode:["read","bash"]});assert.deepEqual(normalizePlanState(null),{enabled:false,toolsBeforePlanMode:undefined});});
+test("prompt is proposal-only",()=>{const p=buildPlanPrompt();for(const x of [/PLAN MODE/,/do not execute/,/Do not modify files/,/do not create plan\.md/i,/Scope and files likely to change/,/Risks, alternatives, and decision points/,/does not constitute approval to implement/])assert.match(p,x);});
