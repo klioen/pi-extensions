@@ -5,6 +5,7 @@
 	"type": "module",
 	"keywords": ["pi-package", "sdlc", "skills"],
 	"pi": {
+		"extensions": ["./extensions"],
 		"skills": ["./skills"]
 	},
 	"peerDependencies": {
