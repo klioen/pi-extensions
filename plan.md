@@ -1,33 +1,34 @@
-# Plan: 为 pi-sdlc 增加结构化 `update_plan`（approved 2026-09-08）
+# Plan: 拆分独立 `pi-todo` 与 `pi-plan`（approved 2026-09-08）
 
 ## Files that change
-- 修改 `packages/sdlc/extensions/plan.ts`：注册 `update_plan` 工具、恢复/展示 session 计划状态。
-- 修改 `packages/sdlc/lib/plan-core.cjs` 与 `.d.cts`：计划校验、状态迁移、渲染辅助和模型指引。
-- 修改 `tests/sdlc-plan-core.test.mjs`：覆盖结构化计划与状态迁移。
-- 修改 `AGENTS.md`：记录隔离验证要求。
+- 新增 `packages/todo/`：独立提供 `todo_write` 和 session 状态/history card。
+- 新增 `packages/plan/`：独立提供只读 `/plan`、tool gate 和 session 状态恢复。
+- 删除 `packages/sdlc/extensions/plan.ts`、`packages/sdlc/lib/plan-core.*`：`pi-sdlc` 只保留 SDLC skills 与 `/init`。
+- 修改根 `package.json`：加载 `pi-todo` 和 `pi-plan`。
+- 移动 `tests/sdlc-plan-core.test.mjs` 到 `tests/plan-core.test.mjs`，新增 todo core 测试。
+- 修改 `AGENTS.md`：记录新的 package 边界和验证要求。
 
 ## Order of work
-1. 提交本计划作为批准审计链。
-2. 实现纯 core 数据模型与迁移验证。
-3. 注册 `update_plan`，把计划写入 session custom entry，并用有限 widget/footer 展示。
-4. 保持 `/plan` 只读边界；在普通模式也允许更新进度，但不授予权限或代表批准。
-5. 跑单测、TypeScript、RPC discovery 与隔离 session 验证。
+1. 保持 todo 数据模型与 renderer 独立，不向模型上下文写入状态。
+2. 将 `/plan` extension/core 原样迁至 `pi-plan`；保留 command、只读 allowlist 与 `/plan off` 行为。
+3. session state 新写为 `pi-plan-state`，恢复时兼容旧 `pi-sdlc-plan` entries，避免已有 session 无法启动。
+4. 从 `pi-sdlc` 删除 plan 实现，使其只提供 `/init` 和 skills。
+5. 跑单测、diff check、TypeScript 和 pi RPC extension discovery；验证 plan mode 禁止 `todo_write` 与写工具。
 
 ## Behavior
-- `update_plan` 接受 explanation 和最多 20 个带稳定 id 的步骤，状态为 `pending`、`in_progress`、`completed` 或 `blocked`。
-- 同时最多一个 `in_progress`；`blocked` 需要 explanation；已完成步骤不可无说明地回退。
-- 状态保存在 pi session JSONL，不写项目 `plan.md`、TODO 文件或代码。
-- footer 只显示简短计数；widget 最多显示 5 个步骤，避免占用编辑器空间。
-- `/plan off` 不清除计划，也不表示实施批准。
+- `todo_write` 接受 explanation 和最多 20 个带稳定 id 的步骤，状态为 `pending`、`in_progress`、`completed` 或 `blocked`。
+- `todo_write` 状态保存在 session JSONL，使用 transcript history card 展示，不写项目文件且不进入模型上下文。
+- `/plan` 是只读协作模式，限制为 `read`、`grep`、`find`、`ls`、受限 `bash`；不允许 `todo_write`。
+- `/plan off` 恢复进入前的工具集合，不代表实施批准。
 
 ## Risks
-- UI 状态可能被误解为正式批准；必须在工具提示、状态文案和 AGENTS.md 中明确它不授权实施。
-- 过度频繁更新会造成 session/TUI 噪声；限制步骤数量和 widget 行数，并要求仅在阶段变化时调用。
+- 已有 session 仍含 `pi-sdlc-plan`，迁移若不兼容会使恢复路径报错；新 package 必须读取该 legacy custom entry。
+- 同时加载新旧 plan extension 会产生重复 `/plan` command；必须移除 sdlc 中的旧 extension 文件。
 - 不采用自然语言 `Plan:` / `[DONE:n]` 解析，因为缺乏稳定 id 和可靠的修订语义。
 
 ## Proof
 - `npm test`
 - `git diff --check`
 - TypeScript 编译
-- pi RPC 发现 `/plan` 与 `update_plan`
-- 隔离 session 验证 session entry 恢复、工具只读边界和不创建项目文件。
+- pi RPC 发现 `/plan` 与 `todo_write`
+- 隔离验证：PLAN MODE 阻止 `todo_write`、`edit`、`write` 和非 allowlisted bash，`/plan off` 恢复工具。

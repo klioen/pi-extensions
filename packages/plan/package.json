@@ -1,0 +1,13 @@
+{
+  "name": "pi-plan",
+  "version": "0.1.0",
+  "description": "Read-only collaborative planning mode for the pi coding agent.",
+  "type": "module",
+  "keywords": ["pi-package", "plan", "read-only"],
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

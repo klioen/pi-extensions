@@ -11,6 +11,8 @@
 			"./packages/env/extensions",
 			"./packages/web-access/extensions",
 			"./packages/subagents/extensions",
+			"./packages/todo/extensions",
+			"./packages/plan/extensions",
 			"./packages/failover/extensions",
 			"./packages/memory/extensions",
 			"./packages/loop/extensions"

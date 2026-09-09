@@ -5,8 +5,8 @@ Custom pi coding-agent packages. Root `package.json` exposes the umbrella runtim
 ## Project layout
 
 - `packages/env` — `.env` loader; keep it first when loading the umbrella package.
-- `packages/web-access`, `subagents`, `failover`, `memory`, `loop` — runtime extensions.
-- `packages/sdlc` — reusable SDLC skills plus the `/init` extension.
+- `packages/web-access`, `subagents`, `todo`, `plan`, `failover`, `memory`, `loop` — runtime extensions.
+- `packages/sdlc` — reusable SDLC skills plus the `/init` extension; `/plan` lives in `packages/plan`.
 - `tests/*.test.mjs` — Node built-in `node:test` coverage for reusable core logic.
 
 ## Commands
@@ -19,7 +19,7 @@ Custom pi coding-agent packages. Root `package.json` exposes the umbrella runtim
 - Run all tests: `npm test`.
 - For extension changes, reload or restart pi before manual verification.
 - Test `/init` in an isolated temporary project: it must create/update only that project's `AGENTS.md` from repository evidence.
-- Test `/plan` in an isolated temporary project: agent `edit`/`write` and non-allowlisted shell commands must be blocked; `/plan off` restores the earlier tool set and creates no project file. `update_plan` must persist only in session state and never authorize implementation.
+- Test `/plan` in an isolated temporary project: agent `edit`/`write`, `todo_write`, and non-allowlisted shell commands must be blocked; `/plan off` restores the earlier tool set and creates no project file. `todo_write` persists only in session state and never authorizes implementation.
 - Never commit credentials, absolute user paths, API keys, or personal data.
 
 ## Conventions
@@ -27,7 +27,7 @@ Custom pi coding-agent packages. Root `package.json` exposes the umbrella runtim
 - Project instructions live in `AGENTS.md`, never `CLAUDE.md`.
 - Packages are under `packages/<name>`; Node built-in `node:test` is the test framework.
 - Runtime dependencies must be zero or declared in `dependencies`; pi core packages are peer-provided.
-- `pi-sdlc` ships both reusable skills (`skills/`) and the `/init` extension (`extensions/`).
+- `pi-sdlc` ships reusable skills (`skills/`) and the `/init` extension; `pi-plan` owns the `/plan` extension.
 
 ## Things pi gets wrong
 
