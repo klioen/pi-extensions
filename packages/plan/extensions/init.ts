@@ -21,7 +21,7 @@ export default function initExtension(pi: ExtensionAPI) {
 			}
 
 			if (!ctx.model) {
-				ctx.ui.notify("pi-sdlc: /init requires a selected model to analyze the project.", "error");
+				ctx.ui.notify("pi-plan: /init requires a selected model to analyze the project.", "error");
 				return;
 			}
 
@@ -33,12 +33,12 @@ export default function initExtension(pi: ExtensionAPI) {
 				pi.sendUserMessage(prompt, queued ? { deliverAs: "followUp" } : undefined);
 				ctx.ui.notify(
 					queued
-						? `pi-sdlc: /init queued; it will ${mode} ${agentsPath} after the current task.`
-						: `pi-sdlc: initializing ${agentsPath} from project evidence.`,
+						? `pi-plan: /init queued; it will ${mode} ${agentsPath} after the current task.`
+						: `pi-plan: initializing ${agentsPath} from project evidence.`,
 					"info",
 				);
 			} catch (error) {
-				ctx.ui.notify(`pi-sdlc: /init could not start: ${String(error)}`, "error");
+				ctx.ui.notify(`pi-plan: /init could not start: ${String(error)}`, "error");
 			}
 		},
 	});

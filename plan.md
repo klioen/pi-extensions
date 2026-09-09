@@ -2,7 +2,7 @@
 
 ## Files that change
 - 新增 `packages/todo/`：独立提供 `todo_write` 和 session 状态/history card。
-- 新增 `packages/plan/`：独立提供只读 `/plan`、tool gate 和 session 状态恢复。
+- 新增 `packages/plan/`：独立提供只读 `/plan`、`/init`、tool gate 和 session 状态恢复。
 - 删除 `packages/sdlc/extensions/plan.ts`、`packages/sdlc/lib/plan-core.*`：`pi-sdlc` 只保留 SDLC skills 与 `/init`。
 - 修改根 `package.json`：加载 `pi-todo` 和 `pi-plan`。
 - 移动 `tests/sdlc-plan-core.test.mjs` 到 `tests/plan-core.test.mjs`，新增 todo core 测试。
@@ -12,7 +12,7 @@
 1. 保持 todo 数据模型与 renderer 独立，不向模型上下文写入状态。
 2. 将 `/plan` extension/core 原样迁至 `pi-plan`；保留 command、只读 allowlist 与 `/plan off` 行为。
 3. session state 新写为 `pi-plan-state`，恢复时兼容旧 `pi-sdlc-plan` entries，避免已有 session 无法启动。
-4. 从 `pi-sdlc` 删除 plan 实现，使其只提供 `/init` 和 skills。
+4. 从 `pi-sdlc` 删除 plan 实现，使其只提供 skills；`pi-plan` 提供 `/plan` 与 `/init`。
 5. 跑单测、diff check、TypeScript 和 pi RPC extension discovery；验证 plan mode 禁止 `todo_write` 与写工具。
 
 ## Behavior

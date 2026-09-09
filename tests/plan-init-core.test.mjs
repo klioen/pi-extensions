@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildInitPrompt, initMode, parseInitArgs } from "../packages/sdlc/lib/init-core.cjs";
+import { buildInitPrompt, initMode, parseInitArgs } from "../packages/plan/lib/init-core.cjs";
 
 test("parseInitArgs accepts default and force modes", () => {
 	assert.deepEqual(parseInitArgs(""), { force: false });

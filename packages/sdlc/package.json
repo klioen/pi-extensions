@@ -1,12 +1,17 @@
 {
 	"name": "pi-sdlc",
 	"version": "0.1.0",
-	"description": "AI-native SDLC skills distilled from Anthropic's 'The AI-Native SDLC playbook': plan/build/test/review/maintain workflows for pi, using AGENTS.md for project memory.",
+	"description": "Reusable AI-native SDLC skills distilled from Anthropic's \"The AI-Native SDLC playbook\", adapted for pi and using AGENTS.md for project memory.",
 	"type": "module",
-	"keywords": ["pi-package", "sdlc", "skills"],
+	"keywords": [
+		"pi-package",
+		"sdlc",
+		"skills"
+	],
 	"pi": {
-		"extensions": ["./extensions"],
-		"skills": ["./skills"]
+		"skills": [
+			"./skills"
+		]
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*"
