@@ -22,10 +22,17 @@ const { spawn } = require("node:child_process");
 const {
 	SCHEMA,
 	phase1Prompt,
-	completeLLM,
 	parseJsonObj,
 	redactSecrets,
 	sessionTranscriptFromJsonl,
+	heartbeatWorkerLease,
+	releaseWorkerLease,
+	upsertPhase1Job,
+	pendingSessionScan,
+	completeSessionScan,
+	selectIdleSessions,
+	resolveRolloutTokenBudget,
+	phase1PiArgs,
 } = require(path.join(__dirname, "..", "lib", "memory-core.cjs"));
 
 const WORKER_ID = `w-${process.pid}`;
@@ -33,6 +40,7 @@ const POLL_MS_DEFAULT = 60_000; // fallback interval when nothing is due (codex:
 const LEASE_MS = 60 * 60 * 1000;        // 1h lease (codex JOB_LEASE_SECONDS=3600); idempotent retry makes it safe
 const RETRY_DELAY_MS = 60 * 60 * 1000;  // 1h retry backoff (codex JOB_RETRY_DELAY_SECONDS)
 const PHASE2_SUCCESS_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h cooldown (codex)
+const PHASE1_AGENT_TIMEOUT_MS = Math.max(30_000, Number(process.env.PI_MEMORY_PHASE1_TIMEOUT_MS) || 10 * 60 * 1000);
 const PHASE2_AGENT_TIMEOUT_MS = 10 * 60 * 1000;
 const CONCURRENCY = Math.max(1, Number(process.env.PI_MEMORY_PHASE1_CONCURRENCY) || 8); // codex default = 8
 const MIN_ROLLOUT_IDLE_MS = (process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS === undefined ? 6 : Number(process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS)) * 3600 * 1000; // codex default 6h; explicit 0 disables the idle gate
@@ -41,6 +49,8 @@ const MAX_UNUSED_DAYS = Math.max(1, Number(process.env.PI_MEMORY_MAX_UNUSED_DAYS
 let cfg = null;
 let db = null;
 let polling = false;
+let coordinatorActive = false;
+let coordinatorTimer = null;
 
 function log(...args) { console.error(`[pi-memory-worker]`, ...args); }
 // Normal operation is quiet; only errors and key state changes hit the footer.
@@ -51,6 +61,7 @@ function debug(...args) {
 
 function openDb() {
 	db = new DatabaseSync(cfg.dbPath);
+	db.exec("PRAGMA busy_timeout=5000;");
 	db.exec("PRAGMA journal_mode=WAL;");
 	db.exec(SCHEMA);
 	try { db.exec("ALTER TABLE stage1_outputs ADD COLUMN generated_at INTEGER"); } catch { /* already migrated */ }
@@ -63,6 +74,32 @@ function kvGet(key, fallback = null) {
 }
 function kvSet(key, value) {
 	db.prepare(`INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`).run(key, JSON.stringify(value));
+}
+
+// ---- session index + phase-1 job discovery ----
+
+function discoverPhase1Jobs() {
+	const scan = pendingSessionScan(db);
+	if (!scan) return 0;
+	const candidates = selectIdleSessions(
+		db,
+		scan.current_session_id || "",
+		Date.now(),
+		Number(cfg.minRolloutIdleMs) || MIN_ROLLOUT_IDLE_MS,
+		Number(cfg.maxRolloutAgeMs) || 10 * 24 * 3600 * 1000,
+		Number(cfg.scanLimit) || 5000,
+	);
+	let enqueued = 0;
+	const max = Math.max(1, Number(cfg.maxRolloutsPerStartup) || 2);
+	for (const session of candidates) {
+		if (enqueued >= max) break;
+		if (upsertPhase1Job(db, session.session_id, session.updated_at, {
+			rolloutPath: session.rollout_path,
+			sessionId: session.session_id,
+		})) enqueued++;
+	}
+	completeSessionScan(db, scan.requested_generation);
+	return enqueued;
 }
 
 // ---- phase-1 job helpers ----
@@ -97,7 +134,7 @@ function claimPhase1Jobs() {
 	// phase-1 job then marks completed without re-running the LLM.
 	const upToDate = rows.filter((row) => {
 		if (!row.input_watermark) return false;
-		const output = db.prepare(`SELECT source_updated_at FROM stage1_outputs WHERE thread_id = ?`).get(row.job_key);
+		const output = db.prepare(`SELECT source_updated_at FROM stage1_outputs WHERE session_id = ?`).get(row.job_key);
 		return output && Number(output.source_updated_at) >= Number(row.input_watermark);
 	});
 	for (const row of upToDate) {
@@ -252,6 +289,52 @@ function ensureLayout() {
 	if (!fs.existsSync(rf)) fs.writeFileSync(rf, "# Raw Memories\n\n");
 }
 
+function memoryChildEnv() {
+	return {
+		...process.env,
+		PI_MEMORY_DIR: cfg.memDir,
+		PI_MEMORY_DB: cfg.dbPath,
+		PI_MEMORY_AUTO: "0",
+		PI_MEMORY_RECALL: "0",
+		PI_MEMORY_AGENT_CHILD: "1",
+		PI_SKIP_VERSION_CHECK: "1",
+	};
+}
+
+function runPhase1WithPi(prompt) {
+	const modelSpec = cfg.llm?.phase2Model || cfg.llm?.model;
+	const args = phase1PiArgs(modelSpec);
+	return new Promise((resolve, reject) => {
+		const child = spawn("pi", args, { env: memoryChildEnv(), cwd: cfg.memDir, stdio: ["pipe", "pipe", "pipe"] });
+		let stdout = "";
+		let stderr = "";
+		let settled = false;
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			child.kill("SIGKILL");
+			reject(new Error("phase1 pi runtime timed out"));
+		}, PHASE1_AGENT_TIMEOUT_MS);
+		child.stdout.on("data", (data) => { stdout += data; });
+		child.stderr.on("data", (data) => { stderr = (stderr + data).slice(-4000); });
+		child.stdin.on("error", () => { /* exit/error handler reports the failure */ });
+		child.on("error", (error) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			reject(error);
+		});
+		child.on("exit", (code) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			if (code === 0 && stdout.trim()) resolve(stdout.trim());
+			else reject(new Error(`phase1 pi exited ${code}: ${stderr.trim() || stdout.trim() || "empty response"}`));
+		});
+		child.stdin.end(prompt);
+	});
+}
+
 // Codex phase-1 writes only to SQLite (stage1_outputs); rollout summary files
 // are materialized later by phase-2 (sync_rollout_summaries_from_memories).
 async function runPhase1(row) {
@@ -261,19 +344,20 @@ async function runPhase1(row) {
 	if (typeof payload.rolloutPath === "string" && fs.existsSync(payload.rolloutPath)) {
 		// Codex loads the full stable rollout AFTER claim. Do the same instead of
 		// relying on a scanner-time tail snapshot.
-		const parsedSession = sessionTranscriptFromJsonl(fs.readFileSync(payload.rolloutPath, "utf8"), cfg.rolloutCharLimit || 20_000);
+		const rolloutTokenBudget = resolveRolloutTokenBudget(cfg.llm?.contextWindow);
+		const parsedSession = sessionTranscriptFromJsonl(fs.readFileSync(payload.rolloutPath, "utf8"), rolloutTokenBudget);
 		transcript = parsedSession.transcript;
 		rolloutCwd = parsedSession.cwd || rolloutCwd || path.dirname(payload.rolloutPath);
 	}
 	if (!transcript || !String(transcript).trim()) throw new Error("rollout transcript unavailable or empty");
 	const prompt = phase1Prompt(String(transcript), typeof payload.rolloutPath === "string" ? payload.rolloutPath : "", rolloutCwd);
-	let raw = await completeLLM(cfg.llm, prompt);
+	let raw = await runPhase1WithPi(prompt);
 	let parsed = parseJsonObj(raw);
 	if (!parsed) {
 		// Models occasionally return prose or a truncated object despite the
 		// prompt. Retry once with an explicit repair instruction before failing.
 		const retryPrompt = `${prompt}\n\nYour previous response was invalid. Return ONLY one valid JSON object with string fields raw_memory, rollout_summary, rollout_slug. Do not explain.`;
-		raw = await completeLLM(cfg.llm, retryPrompt);
+		raw = await runPhase1WithPi(retryPrompt);
 		parsed = parseJsonObj(raw);
 	}
 	if (!parsed || typeof parsed !== "object") {
@@ -292,17 +376,17 @@ async function runPhase1(row) {
 	const rolloutSlug = typeof parsed.rollout_slug === "string" && parsed.rollout_slug.trim()
 		? redactSecrets(parsed.rollout_slug.trim())
 		: null;
-	const threadId = typeof payload.threadId === "string" && payload.threadId ? payload.threadId : row.job_key;
+	const sessionId = typeof payload.sessionId === "string" && payload.sessionId ? payload.sessionId : row.job_key;
 	const sourceUpdatedAt = Number(row.input_watermark) || Date.now(); // codex: source_updated_at = input watermark
 	const cwd = typeof rolloutCwd === "string" ? rolloutCwd : "";
 	db.prepare(
-		`INSERT INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, generated_at, rollout_slug, cwd, usage_count, last_usage)
+		`INSERT INTO stage1_outputs (session_id, source_updated_at, raw_memory, rollout_summary, generated_at, rollout_slug, cwd, usage_count, last_usage)
      VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)
-     ON CONFLICT(thread_id) DO UPDATE SET source_updated_at=excluded.source_updated_at, raw_memory=excluded.raw_memory,
+     ON CONFLICT(session_id) DO UPDATE SET source_updated_at=excluded.source_updated_at, raw_memory=excluded.raw_memory,
        rollout_summary=excluded.rollout_summary, generated_at=excluded.generated_at,
        rollout_slug=excluded.rollout_slug, cwd=excluded.cwd`,
-	).run(threadId, sourceUpdatedAt, rawMemory, rolloutSummary, Date.now(), rolloutSlug, cwd);
-	debug(`phase1 done: ${threadId} -> stage1_outputs (watermark ${sourceUpdatedAt})`);
+	).run(sessionId, sourceUpdatedAt, rawMemory, rolloutSummary, Date.now(), rolloutSlug, cwd);
+	debug(`phase1 done: ${sessionId} -> stage1_outputs (watermark ${sourceUpdatedAt})`);
 	// phase-1 success advances the phase-2 watermark (codex: enqueue_global_consolidation)
 	enqueuePhase2();
 }
@@ -391,7 +475,7 @@ const MAX_RAW_FOR_CONSOLIDATION = Math.max(1, Number(process.env.PI_MEMORY_MAX_R
 function rolloutStem(m) {
 	const ts = new Date(Number(m.source_updated_at) || Date.now()).toISOString().replace(/[:.]/g, "-").slice(0, 23);
 	const slug = (m.rollout_slug || "rollout").replace(/[^\w-]+/g, "-").replace(/^-+|-+$/g, "");
-	return `${ts}-${slug}-${String(m.thread_id).slice(0, 8)}`;
+	return `${ts}-${slug}-${String(m.session_id).slice(0, 8)}`;
 }
 
 function materializePhase2Inputs() {
@@ -406,7 +490,7 @@ function materializePhase2Inputs() {
 		        OR (last_usage IS NULL AND source_updated_at >= ?))
 		 ORDER BY COALESCE(usage_count, 0) DESC,
 		          COALESCE(last_usage, source_updated_at) DESC,
-		          source_updated_at DESC, thread_id DESC
+		          source_updated_at DESC, session_id DESC
 		 LIMIT ?`,
 	).all(unusedCutoff, unusedCutoff, MAX_RAW_FOR_CONSOLIDATION);
 	// Codex max_unused_days retention. The next workspace sync also prunes
@@ -436,7 +520,7 @@ function materializePhase2Inputs() {
 			[
 				`# ${m.rollout_slug || "rollout"}`,
 				``,
-				`- thread_id: ${m.thread_id}`,
+				`- session_id: ${m.session_id}`,
 				`- updated_at: ${new Date(Number(m.source_updated_at)).toISOString()}`,
 				`- cwd: ${m.cwd || ""}`,
 				``,
@@ -446,14 +530,14 @@ function materializePhase2Inputs() {
 		);
 	}
 
-	// rebuild raw_memories.md (merged, stable ascending thread-id order like codex)
+	// rebuild raw_memories.md (merged, stable ascending session-id order)
 	let body = "# Raw Memories\n\n";
 	if (selected.length === 0) body += "No raw memories yet.\n";
 	else {
-		body += "Merged stage-1 raw memories (stable ascending thread-id order):\n\n";
-		const asc = [...selected].sort((a, b) => (a.thread_id < b.thread_id ? -1 : a.thread_id > b.thread_id ? 1 : 0));
+		body += "Merged stage-1 raw memories (stable ascending session-id order):\n\n";
+		const asc = [...selected].sort((a, b) => (a.session_id < b.session_id ? -1 : a.session_id > b.session_id ? 1 : 0));
 		for (const m of asc) {
-			body += `## Thread \`${m.thread_id}\` (${new Date(Number(m.source_updated_at)).toISOString()})\n\n`;
+			body += `## Session \`${m.session_id}\` (${new Date(Number(m.source_updated_at)).toISOString()})\n\n`;
 			body += `updated_at: ${new Date(Number(m.source_updated_at)).toISOString()}\n`;
 			if (m.cwd) body += `cwd: ${m.cwd}\n`;
 			body += `rollout_summary_file: rollout_summaries/${rolloutStem(m)}.md\n\n`;
@@ -539,7 +623,7 @@ function nextWakeMs(now) {
 	// - phase2: retry_until backoff, or cooldown expiry
 	// - fallback: default poll interval
 	const idleMs = MIN_ROLLOUT_IDLE_MS;
-	let earliest = now + POLL_MS_DEFAULT;
+	let earliest = now + Math.max(500, Number(cfg?.pollMs) || POLL_MS_DEFAULT);
 	try {
 		for (const row of db.prepare(
 			`SELECT kind, status, input_watermark, retry_until FROM jobs WHERE status IN ('pending','failed')`,
@@ -559,10 +643,14 @@ function nextWakeMs(now) {
 }
 
 async function pollOnce() {
-	if (!db || polling) return 0;
+	if (!db || polling || !coordinatorActive) return 0;
+	// Never claim new work unless this process can still renew the global lease.
+	// A transient SQLite error skips this poll; a token mismatch schedules exit.
+	if (!heartbeatCoordinator()) return 0;
 	polling = true;
 	let didWork = false;
 	try {
+		discoverPhase1Jobs();
 		// Phase 1 jobs run concurrently (Codex buffer_unordered(CONCURRENCY_LIMIT)).
 		const phase1 = claimPhase1Jobs();
 		if (phase1.length > 0) didWork = true;
@@ -588,7 +676,42 @@ async function pollOnce() {
 	return didWork ? 1 : 0;
 }
 
+function coordinatorConfig() {
+	const coordinator = cfg?.coordinator;
+	if (!coordinator?.leaseKey || !coordinator?.token || !coordinator?.leaseMs) return null;
+	return coordinator;
+}
+
+function heartbeatCoordinator() {
+	const coordinator = coordinatorConfig();
+	if (!db || !coordinator || !coordinatorActive) return false;
+	try {
+		const owned = heartbeatWorkerLease(db, coordinator.leaseKey, coordinator.token, coordinator.leaseMs);
+		if (!owned) {
+			coordinatorActive = false;
+			log("global worker lease lost; stopping");
+			setImmediate(() => process.exit(0));
+		}
+		return owned;
+	} catch (error) {
+		// A transient SQLite busy error must not surrender ownership prematurely;
+		// the next heartbeat retries before the short lease expires.
+		log("worker lease heartbeat failed:", error.message);
+		return false;
+	}
+}
+
 function startLoop() {
+	const coordinator = coordinatorConfig();
+	if (!coordinator) {
+		log("missing global worker coordinator config; exiting");
+		process.exit(1);
+		return;
+	}
+	coordinatorActive = true;
+	if (!heartbeatCoordinator()) return;
+	coordinatorTimer = setInterval(heartbeatCoordinator, Math.max(1000, Number(coordinator.heartbeatMs) || 10_000));
+	coordinatorTimer.unref?.();
 	prepareMemoryWorkspace(); // baseline must exist BEFORE phase-1 writes (codex: prepare_memory_workspace at startup)
 	// Codex is event-driven (work is spawned per turn), so a fixed fast poll
 	// wastes cycles — especially with the 6h idle gate. Sleep until the next
@@ -610,9 +733,14 @@ function releaseOwnLeases() {
 		const now = Date.now();
 		const res = db.prepare(
 			`UPDATE jobs SET status='pending', worker_id=NULL, ownership_token=NULL, lease_until=NULL, started_at=NULL
-			 WHERE status='leased' AND worker_id = ? AND lease_until > ?`,
+			 WHERE status IN ('leased','running') AND worker_id = ? AND lease_until > ?`,
 		).run(WORKER_ID, now);
-		if (res.changes > 0) debug(`released ${res.changes} stranded leased job(s) owned by ${WORKER_ID}`);
+		if (res.changes > 0) debug(`released ${res.changes} stranded job lease(s) owned by ${WORKER_ID}`);
+		const coordinator = coordinatorConfig();
+		if (coordinator) releaseWorkerLease(db, coordinator.leaseKey, coordinator.token);
+		coordinatorActive = false;
+		if (coordinatorTimer) clearInterval(coordinatorTimer);
+		coordinatorTimer = null;
 	} catch {
 		/* best-effort on exit */
 	}

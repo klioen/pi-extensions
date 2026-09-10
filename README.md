@@ -67,7 +67,9 @@ Local markdown-file memory for pi, modeled after **Codex's memory system** (`cod
 
 **Recall** (every `before_agent_start`): `memory_summary.md` is injected into the system prompt with a decision boundary ("skip memory only when clearly self-contained") and a lightweight quick-pass (≤4–6 search steps), mirroring Codex's `read_path.md`.
 
-Config (env): `PI_MEMORY_DIR`, `PI_MEMORY_DB`, `PI_MEMORY_AUTO=0` (disable phase 1), `PI_MEMORY_RECALL=0` (disable injection), `PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS` (default 6), `PI_MEMORY_MAX_ROLLOUT_AGE_DAYS` (default 10), `PI_MEMORY_SCAN_LIMIT` (default 5000), `PI_MEMORY_MAX_ROLLOUTS_PER_STARTUP` (default 2), `PI_MEMORY_PHASE1_CONCURRENCY` (default 8), `PI_MEMORY_MAX_UNUSED_DAYS` (default 30), `PI_MEMORY_MAX_RAW_CONSOLIDATION` (default 256), `PI_MEMORY_SUMMARY_TOKENS`, `PI_MEMORY_ROLLOUT_CHARS`.
+Phase-1 extraction runs through pi's selected provider runtime in an ephemeral, tool-free `pi --print` child, so provider-specific protocols, routing, and authentication are preserved. Rollout input uses 70% of the selected model's `contextWindow`; when unavailable, it falls back to 150,000 tokens. Token accounting follows pi's conservative text estimate (`ceil(chars / 4)`) and preserves the rollout head and tail when truncation is needed.
+
+Config (env): `PI_MEMORY_DIR`, `PI_MEMORY_DB`, `PI_MEMORY_AUTO=0` (disable phase 1), `PI_MEMORY_RECALL=0` (disable injection), `PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS` (default 6), `PI_MEMORY_MAX_ROLLOUT_AGE_DAYS` (default 10), `PI_MEMORY_SCAN_LIMIT` (default 5000), `PI_MEMORY_MAX_ROLLOUTS_PER_STARTUP` (default 2), `PI_MEMORY_PHASE1_CONCURRENCY` (default 8), `PI_MEMORY_MAX_UNUSED_DAYS` (default 30), `PI_MEMORY_MAX_RAW_CONSOLIDATION` (default 256), `PI_MEMORY_SUMMARY_TOKENS`.
 
 ## Install
 

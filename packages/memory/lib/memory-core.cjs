@@ -11,7 +11,7 @@
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS jobs (
     kind TEXT NOT NULL,            -- 'phase1' | 'memory_consolidate_global'
-    job_key TEXT NOT NULL,         -- thread_id for phase1, 'consolidation' for phase2
+    job_key TEXT NOT NULL,         -- session_id for phase1, 'consolidation' for phase2
     status TEXT NOT NULL,          -- pending / leased / completed / failed
     worker_id TEXT,
     ownership_token TEXT,
@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     PRIMARY KEY (kind, job_key)
 );
 CREATE TABLE IF NOT EXISTS stage1_outputs (
-    thread_id TEXT PRIMARY KEY,
+    session_id TEXT PRIMARY KEY,
     source_updated_at INTEGER NOT NULL,
     raw_memory TEXT NOT NULL,
     rollout_summary TEXT NOT NULL,
@@ -39,13 +39,76 @@ CREATE TABLE IF NOT EXISTS stage1_outputs (
     usage_count INTEGER,
     last_usage INTEGER
 );
+CREATE TABLE IF NOT EXISTS worker_leases (
+    lease_key TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    ownership_token TEXT NOT NULL,
+    lease_until INTEGER NOT NULL,
+    heartbeat_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    rollout_path TEXT NOT NULL UNIQUE,
+    updated_at INTEGER NOT NULL,
+    cwd TEXT,
+    last_seen_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS session_scan_state (
+    scan_key TEXT PRIMARY KEY,
+    requested_generation INTEGER NOT NULL,
+    completed_generation INTEGER NOT NULL,
+    requested_at INTEGER NOT NULL,
+    current_session_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC, session_id DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_kind_status ON jobs(kind, status);
 CREATE INDEX IF NOT EXISTS idx_jobs_status_lease ON jobs(status, lease_until);
 `;
 
 // ---------------------------------------------------------------------------
-// Phase 1 prompt (port of codex-rs stage_one_system.md + stage_one_input.md)
+// Phase 1 prompt + rollout input budget
 // ---------------------------------------------------------------------------
+
+const DEFAULT_ROLLOUT_TOKEN_LIMIT = 150_000;
+const ROLLOUT_CONTEXT_WINDOW_PERCENT = 70;
+
+// Match pi's built-in estimateTokens heuristic for text: ceil(chars / 4).
+function estimateTextTokens(text) {
+	return Math.ceil(String(text ?? "").length / 4);
+}
+
+function resolveRolloutTokenBudget(contextWindow) {
+	const window = Number(contextWindow);
+	if (!Number.isFinite(window) || window <= 0) return DEFAULT_ROLLOUT_TOKEN_LIMIT;
+	return Math.max(1, Math.floor(window * ROLLOUT_CONTEXT_WINDOW_PERCENT / 100));
+}
+
+function truncateTextToTokenBudget(text, maxTokens) {
+	const value = String(text ?? "");
+	const tokens = Math.max(1, Math.floor(Number(maxTokens) || 1));
+	if (estimateTextTokens(value) <= tokens) return value;
+	const marker = "\n\n[... rollout middle omitted for token budget ...]\n\n";
+	const maxChars = tokens * 4;
+	const contentChars = Math.max(0, maxChars - marker.length);
+	const headChars = Math.floor(contentChars * 0.4);
+	const tailChars = contentChars - headChars;
+	return `${value.slice(0, headChars)}${marker}${value.slice(-tailChars)}`;
+}
+
+function phase1PiArgs(modelSpec) {
+	const args = [
+		"--print",
+		"--no-session",
+		"--no-tools",
+		"--no-skills",
+		"--no-prompt-templates",
+		"--no-themes",
+		"--no-context-files",
+	];
+	if (modelSpec) args.push("--model", modelSpec);
+	return args;
+}
 
 function phase1Prompt(transcript, rolloutPath, rolloutCwd) {
 	return `Analyze this rollout and produce JSON with \`raw_memory\`, \`rollout_summary\`, and \`rollout_slug\` (use empty string when unknown).
@@ -130,7 +193,7 @@ function redactSecrets(text) {
 }
 
 /** Parse a full pi JSONL session into an LLM-safe transcript. */
-function sessionTranscriptFromJsonl(jsonl, maxChars) {
+function sessionTranscriptFromJsonl(jsonl, maxTokens) {
 	const parts = [];
 	let lastTs = 0;
 	let cwd = "";
@@ -169,12 +232,9 @@ function sessionTranscriptFromJsonl(jsonl, maxChars) {
 		parts.push(...rendered);
 	}
 	const full = parts.join("\n\n");
-	const limit = Math.max(1, Number(maxChars) || full.length);
-	// Preserve both the original problem framing and recent decisions when a
-	// rollout exceeds the model-input budget.
-	const transcript = full.length <= limit
-		? full
-		: `${full.slice(0, Math.floor(limit * 0.4))}\n\n[... rollout middle omitted for input budget ...]\n\n${full.slice(-(limit - Math.floor(limit * 0.4)) )}`;
+	// Preserve both the original problem framing and recent decisions using the
+	// same chars/4 token estimate as pi's context accounting.
+	const transcript = truncateTextToTokenBudget(full, maxTokens);
 	return { transcript, lastTs, cwd, sessionId };
 }
 
@@ -200,12 +260,116 @@ function upsertPhase1Job(db, jobKey, inputWatermark, payload, now = Date.now()) 
 		     -- again even if the rollout watermark itself has not changed.
 		     OR (jobs.status='completed' AND NOT EXISTS (
 		       SELECT 1 FROM stage1_outputs AS so
-		       WHERE so.thread_id=jobs.job_key
+		       WHERE so.session_id=jobs.job_key
 		         AND so.source_updated_at >= COALESCE(jobs.input_watermark, 0)
 		     ))
 		   )`,
 	).run(jobKey, JSON.stringify(payload), inputWatermark, now);
 	return result.changes > 0;
+}
+
+function upsertSession(db, sessionId, rolloutPath, updatedAt, cwd, now = Date.now()) {
+	const result = db.prepare(
+		`INSERT INTO sessions (session_id, rollout_path, updated_at, cwd, last_seen_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(session_id) DO UPDATE SET
+		   rollout_path=excluded.rollout_path,
+		   updated_at=MAX(sessions.updated_at, excluded.updated_at),
+		   cwd=COALESCE(excluded.cwd, sessions.cwd),
+		   last_seen_at=excluded.last_seen_at`,
+	).run(sessionId, rolloutPath, updatedAt, cwd ?? null, now);
+	return Number(result.changes) > 0;
+}
+
+function requestSessionScan(db, currentSessionId, scanKey = "phase1", now = Date.now()) {
+	db.prepare(
+		`INSERT INTO session_scan_state (scan_key, requested_generation, completed_generation, requested_at, current_session_id)
+		 VALUES (?, 1, 0, ?, ?)
+		 ON CONFLICT(scan_key) DO UPDATE SET
+		   requested_generation=session_scan_state.requested_generation+1,
+		   requested_at=excluded.requested_at,
+		   current_session_id=excluded.current_session_id`,
+	).run(scanKey, now, currentSessionId ?? null);
+	return db.prepare(`SELECT requested_generation FROM session_scan_state WHERE scan_key=?`).get(scanKey).requested_generation;
+}
+
+function pendingSessionScan(db, scanKey = "phase1") {
+	const row = db.prepare(
+		`SELECT requested_generation, completed_generation, requested_at, current_session_id
+		 FROM session_scan_state WHERE scan_key=? AND requested_generation>completed_generation`,
+	).get(scanKey);
+	return row || null;
+}
+
+function completeSessionScan(db, generation, scanKey = "phase1") {
+	const result = db.prepare(
+		`UPDATE session_scan_state SET completed_generation=MAX(completed_generation, ?)
+		 WHERE scan_key=? AND requested_generation>=?`,
+	).run(generation, scanKey, generation);
+	return Number(result.changes) > 0;
+}
+
+function selectIdleSessions(db, currentSessionId, now, minIdleMs, maxAgeMs, limit) {
+	const idleCutoff = now - Math.max(0, Number(minIdleMs) || 0);
+	const ageCutoff = now - Math.max(0, Number(maxAgeMs) || 0);
+	return db.prepare(
+		`SELECT s.session_id, s.rollout_path, s.updated_at, s.cwd
+		 FROM sessions AS s
+		 LEFT JOIN jobs AS j ON j.kind='phase1' AND j.job_key=s.session_id
+		 LEFT JOIN stage1_outputs AS so ON so.session_id=s.session_id
+		 WHERE s.session_id != ?
+		   AND s.updated_at >= ?
+		   AND s.updated_at <= ?
+		   AND (
+		     j.job_key IS NULL
+		     OR (j.status IN ('pending','failed','completed') AND s.updated_at > COALESCE(j.input_watermark, 0))
+		     OR (j.status='completed' AND (so.session_id IS NULL OR so.source_updated_at < j.input_watermark))
+		   )
+		 ORDER BY s.updated_at DESC, s.session_id DESC
+		 LIMIT ?`,
+	).all(currentSessionId ?? "", ageCutoff, idleCutoff, Math.max(1, Number(limit) || 1));
+}
+
+/** Atomically claim a singleton worker lease. Expired owners may be replaced. */
+function claimWorkerLease(db, leaseKey, ownerId, ownershipToken, leaseMs, now = Date.now()) {
+	const until = now + Math.max(1, Number(leaseMs) || 1);
+	const result = db.prepare(
+		`INSERT INTO worker_leases (lease_key, owner_id, ownership_token, lease_until, heartbeat_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(lease_key) DO UPDATE SET
+		   owner_id=excluded.owner_id,
+		   ownership_token=excluded.ownership_token,
+		   lease_until=excluded.lease_until,
+		   heartbeat_at=excluded.heartbeat_at,
+		   created_at=excluded.created_at
+		 WHERE worker_leases.lease_until <= ?`,
+	).run(leaseKey, ownerId, ownershipToken, until, now, now, now);
+	return Number(result.changes) > 0;
+}
+
+/** Extend a lease only while the caller still owns its token. */
+function heartbeatWorkerLease(db, leaseKey, ownershipToken, leaseMs, now = Date.now()) {
+	const until = now + Math.max(1, Number(leaseMs) || 1);
+	const result = db.prepare(
+		`UPDATE worker_leases SET lease_until=?, heartbeat_at=?
+		 WHERE lease_key=? AND ownership_token=? AND lease_until > ?`,
+	).run(until, now, leaseKey, ownershipToken, now);
+	return Number(result.changes) > 0;
+}
+
+/** Release a lease without allowing an old owner to clear a successor. */
+function releaseWorkerLease(db, leaseKey, ownershipToken) {
+	const result = db.prepare(
+		`DELETE FROM worker_leases WHERE lease_key=? AND ownership_token=?`,
+	).run(leaseKey, ownershipToken);
+	return Number(result.changes) > 0;
+}
+
+function inspectWorkerLease(db, leaseKey) {
+	return db.prepare(
+		`SELECT lease_key, owner_id, ownership_token, lease_until, heartbeat_at, created_at
+		 FROM worker_leases WHERE lease_key=?`,
+	).get(leaseKey) || null;
 }
 
 /** Best-effort JSON repair for LLM output (jsonrepair-lite). */
@@ -243,67 +407,27 @@ function repairJsonText(text) {
 	return repaired;
 }
 
-/**
- * Stream an OpenAI-compatible chat completion, collect text content.
- * config: { baseUrl, model, apiKey, maxTokens }
- */
-async function completeLLM(config, prompt, signal) {
-	const url = `${config.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-	const body = {
-		model: config.model,
-		messages: [{ role: "user", content: prompt }],
-		stream: true,
-		...(config.maxTokens ? { max_tokens: config.maxTokens } : {}),
-		...(config.extraBody ?? {}),
-	};
-	const res = await fetch(url, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
-		},
-		body: JSON.stringify(body),
-		signal,
-	});
-	if (!res.ok) {
-		const text = await res.text().catch(() => "");
-		throw new Error(`LLM HTTP ${res.status}: ${text.slice(0, 300)}`);
-	}
-	// SSE parse
-	let text = "";
-	let buffer = "";
-	const reader = res.body.getReader();
-	const decoder = new TextDecoder();
-	for (;;) {
-		const { done, value } = await reader.read();
-		if (done) break;
-		buffer += decoder.decode(value, { stream: true });
-		const lines = buffer.split("\n");
-		buffer = lines.pop() ?? "";
-		for (const line of lines) {
-			const s = line.trim();
-			if (!s.startsWith("data:")) continue;
-			const data = s.slice(5).trim();
-			if (data === "[DONE]") continue;
-			try {
-				const chunk = JSON.parse(data);
-				const delta = chunk.choices?.[0]?.delta?.content;
-				if (typeof delta === "string") text += delta;
-			} catch {
-				/* ignore malformed chunk */
-			}
-		}
-	}
-	return text.trim();
-}
-
 module.exports = {
 	SCHEMA,
+	DEFAULT_ROLLOUT_TOKEN_LIMIT,
+	ROLLOUT_CONTEXT_WINDOW_PERCENT,
+	estimateTextTokens,
+	resolveRolloutTokenBudget,
+	truncateTextToTokenBudget,
+	phase1PiArgs,
 	phase1Prompt,
-	completeLLM,
 	parseJsonObj,
 	repairJsonText,
 	redactSecrets,
 	sessionTranscriptFromJsonl,
 	upsertPhase1Job,
+	upsertSession,
+	requestSessionScan,
+	pendingSessionScan,
+	completeSessionScan,
+	selectIdleSessions,
+	claimWorkerLease,
+	heartbeatWorkerLease,
+	releaseWorkerLease,
+	inspectWorkerLease,
 };
