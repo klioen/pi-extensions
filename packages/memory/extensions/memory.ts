@@ -46,8 +46,10 @@ const MEMORY_DIR = (process.env.PI_MEMORY_DIR || path.join(os.homedir(), ".pi", 
 const DB_PATH = process.env.PI_MEMORY_DB || path.join(os.homedir(), ".pi", "agent", "sqlite", "memory.db");
 const RECALL_ENABLED = process.env.PI_MEMORY_RECALL !== "0";
 const AUTO_ENQUEUE = process.env.PI_MEMORY_AUTO !== "0";
-const SUMMARY_TOKEN_LIMIT = Math.max(500, Number(process.env.PI_MEMORY_SUMMARY_TOKENS) || 4000);
-const EXTRACT_MODEL = process.env.PI_MEMORY_EXTRACT_MODEL || ""; // optional override, like codex extract_model
+const SUMMARY_TOKEN_LIMIT = Math.max(500, Number(process.env.PI_MEMORY_SUMMARY_TOKENS) || memoryCore.MEMORY_RECALL_SUMMARY_TOKEN_LIMIT);
+const DEFAULT_MEMORY_MODEL = "traex/DeepSeek-V4-Flash";
+const DEFAULT_MEMORY_CONTEXT_WINDOW = 184_000;
+const EXTRACT_MODEL = process.env.PI_MEMORY_EXTRACT_MODEL || DEFAULT_MEMORY_MODEL; // optional override, like codex extract_model
 const MIN_ROLLOUT_IDLE_HOURS = process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS === undefined ? 6 : Math.max(0, Number(process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS)); // forwarded to the global worker
 const MAX_ROLLOUT_AGE_DAYS = Math.max(1, Number(process.env.PI_MEMORY_MAX_ROLLOUT_AGE_DAYS) || 10); // forwarded to the global worker
 const SCAN_LIMIT = Math.max(1, Number(process.env.PI_MEMORY_SCAN_LIMIT) || 5000); // forwarded to the global worker
@@ -77,8 +79,15 @@ function getDb(): DatabaseSync {
 		db.exec("PRAGMA busy_timeout=5000;");
 		db.exec("PRAGMA journal_mode=WAL;");
 		db.exec(memoryCore.SCHEMA);
-		// Safe forward migration for databases created before generated_at.
-		try { db.exec("ALTER TABLE stage1_outputs ADD COLUMN generated_at INTEGER"); } catch { /* already migrated */ }
+		// Safe forward migrations for databases created by earlier pi-memory builds.
+		for (const sql of [
+			"ALTER TABLE stage1_outputs ADD COLUMN generated_at INTEGER",
+			"ALTER TABLE stage1_outputs ADD COLUMN rollout_path TEXT",
+			"ALTER TABLE stage1_outputs ADD COLUMN selected_for_phase2 INTEGER NOT NULL DEFAULT 0",
+			"ALTER TABLE stage1_outputs ADD COLUMN selected_for_phase2_source_updated_at INTEGER",
+		]) {
+			try { db.exec(sql); } catch { /* already migrated */ }
+		}
 	}
 	return db;
 }
@@ -150,19 +159,21 @@ const workerOwnerId = `pi-${process.pid}-${randomUUID()}`;
 
 function resolveExtractModel(ctxModel: unknown): { baseUrl: string; model: string; phase2Model: string; apiKey: string; maxTokens?: number; contextWindow?: number } {
 	const m = ctxModel as { baseUrl?: string; id?: string; provider?: string; contextWindow?: number } | undefined;
-	// baseUrl: explicit override, else the current model's baseUrl. When that is
-	// unavailable fall back to the ark OpenAI-compatible endpoint (the default pi
-	// provider) rather than ollama.
+	// baseUrl/apiKey remain in the worker config for compatibility; inference is
+	// performed by pi's selected provider runtime rather than direct HTTP calls.
 	const baseUrl = process.env.PI_MEMORY_BASE_URL || m?.baseUrl || "https://ark.cn-beijing.volces.com/api/coding/v3";
-	// extract model: explicit override, else the current model id.
-	const model = EXTRACT_MODEL || process.env.PI_MEMORY_EXTRACT_MODEL || m?.id || "";
-	// phase-2 consolidation AGENT model: explicit, else same as extract model.
-	// `pi --print --model <provider>/<id>` expects the provider-prefixed form.
-	const phase2Model = process.env.PI_MEMORY_PHASE2_MODEL || (m?.provider ? `${m.provider}/${model}` : model);
+	const activeModel = m?.id ? (m.provider ? `${m.provider}/${m.id}` : m.id) : "";
+	const model = EXTRACT_MODEL || activeModel;
+	const phase2Model = process.env.PI_MEMORY_PHASE2_MODEL || model;
 	const keys = (process.env.ARK_API_KEYS || "").split(",").map((k) => k.trim()).filter(Boolean);
 	const apiKey = keys[0] || process.env.ARK_API_KEY || (m?.provider ? process.env[`${m.provider.toUpperCase()}_API_KEY`] : "") || "placeholder";
 	const maxTokens = Number(process.env.PI_MEMORY_EXTRACT_MAX_TOKENS) || 2048;
-	const contextWindow = Number(m?.contextWindow) > 0 ? Number(m?.contextWindow) : undefined;
+	// Never reuse the active model's context window for a different override.
+	// The selected default is known from TraeX's live catalog; unknown overrides
+	// intentionally fall back to the core 150K rollout budget.
+	const contextWindow = model === DEFAULT_MEMORY_MODEL
+		? DEFAULT_MEMORY_CONTEXT_WINDOW
+		: model === activeModel && Number(m?.contextWindow) > 0 ? Number(m?.contextWindow) : undefined;
 	return { baseUrl, model, phase2Model, apiKey, maxTokens, contextWindow };
 }
 
@@ -243,49 +254,12 @@ function ensureLayout(): void {
 	}
 }
 
-function recordRolloutSummaryUsage(readPath: unknown): void {
-	if (typeof readPath !== "string") return;
-	const summariesDir = path.join(MEMORY_DIR, "rollout_summaries") + path.sep;
-	const resolved = path.resolve(readPath);
-	if (!resolved.startsWith(summariesDir) || !resolved.endsWith(".md")) return;
-	// Materialized filenames end in the first 8 chars of session_id. UUID-prefix
-	// collisions are negligible; update only that cited rollout output.
-	const m = path.basename(resolved, ".md").match(/-([0-9a-f]{8})$/i);
-	if (!m) return;
-	const now = Date.now();
-	getDb().prepare(
-		`UPDATE stage1_outputs
-		 SET usage_count=COALESCE(usage_count, 0)+1, last_usage=?
-		 WHERE substr(session_id, 1, 8)=?`,
-	).run(now, m[1]);
-}
-
 function buildRecallBlock(): string {
 	ensureLayout();
 	try {
 		const summary = fs.readFileSync(path.join(MEMORY_DIR, "memory_summary.md"), "utf8").trim();
 		if (!summary || summary === "v1\n\n## User Profile\n\n(empty)") return "";
-		const truncated = summary.slice(0, SUMMARY_TOKEN_LIMIT * 4);
-		return [
-			`## Memory`,
-			``,
-			`You have access to a memory folder with guidance from prior runs. Use it whenever it is likely to help.`,
-			``,
-			`Decision boundary: skip memory ONLY when the request is clearly self-contained (current date, simple translation, one-line command). Otherwise use memory by default when the task involves workspace history, conventions, prior decisions, the user's preferences, or could depend on earlier project choices.`,
-			``,
-			`Memory layout (general -> specific):`,
-			`- ${path.join(MEMORY_DIR, "memory_summary.md")} (provided below; do NOT open again)`,
-			`- ${path.join(MEMORY_DIR, "MEMORY.md")} (searchable registry; primary file to query)`,
-			`- ${path.join(MEMORY_DIR, "skills")}/<skill-name>/SKILL.md (reusable procedures)`,
-			`- ${path.join(MEMORY_DIR, "rollout_summaries")}/ (per-rollout recaps)`,
-			``,
-			`Quick pass: skim the summary below, extract relevant keywords, then search MEMORY.md using those keywords, and open 1-2 relevant rollout summaries or skills if pointed to. Keep lookup lightweight (<= 4-6 steps).`,
-			``,
-			`memory_summary.md:`,
-			truncated,
-			``,
-			`If you rely on memory for facts you did not verify in this turn, say so briefly and note the answer may be stale.`,
-		].join("\n");
+		return memoryCore.buildMemoryRecallPrompt(MEMORY_DIR, summary, SUMMARY_TOKEN_LIMIT);
 	} catch {
 		return "";
 	}
@@ -300,29 +274,25 @@ export default function (pi: ExtensionAPI) {
 	getDb();
 
 	if (RECALL_ENABLED) {
-		pi.on("before_agent_start", async () => {
+		pi.on("before_agent_start", async (event) => {
 			try {
 				const block = buildRecallBlock();
 				if (!block) return;
-				return {
-					message: {
-						customType: "pi-memory-recall",
-						content: block,
-						display: false,
-					},
-				};
+				return { systemPrompt: `${event.systemPrompt}\n\n${block}` };
 			} catch {
 				return undefined;
 			}
 		});
-	}
 
-	// Codex records usage when a model cites a specific stage-1 memory. pi has
-	// no native citation item, so a read of a materialized rollout summary is
-	// the deterministic equivalent and drives retention/phase2 selection.
-	pi.on("tool_execution_start", async (event) => {
-		if (event.toolName === "read") recordRolloutSummaryUsage(event.args?.path);
-	});
+		pi.on("message_end", async (event) => {
+			const stripped = memoryCore.stripAssistantMemoryCitations(event.message);
+			if (stripped.sessionIds.length > 0) {
+				memoryCore.recordMemoryCitationUsage(getDb(), stripped.sessionIds);
+			}
+			if (stripped.message !== event.message) return { message: stripped.message };
+			return undefined;
+		});
+	}
 
 	pi.on("session_start", async (_event, ctx) => {
 		// When running as a phase-2 consolidation agent (forked by the worker),

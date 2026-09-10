@@ -33,6 +33,10 @@ const {
 	selectIdleSessions,
 	resolveRolloutTokenBudget,
 	phase1PiArgs,
+	phase2Prompt,
+	phase2PiArgs,
+	PHASE2_WORKSPACE_DIFF_FILE,
+	PHASE2_WORKSPACE_DIFF_MAX_BYTES,
 } = require(path.join(__dirname, "..", "lib", "memory-core.cjs"));
 
 const WORKER_ID = `w-${process.pid}`;
@@ -42,6 +46,7 @@ const RETRY_DELAY_MS = 60 * 60 * 1000;  // 1h retry backoff (codex JOB_RETRY_DEL
 const PHASE2_SUCCESS_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h cooldown (codex)
 const PHASE1_AGENT_TIMEOUT_MS = Math.max(30_000, Number(process.env.PI_MEMORY_PHASE1_TIMEOUT_MS) || 10 * 60 * 1000);
 const PHASE2_AGENT_TIMEOUT_MS = 10 * 60 * 1000;
+const PHASE2_HEARTBEAT_MS = 90 * 1000;
 const CONCURRENCY = Math.max(1, Number(process.env.PI_MEMORY_PHASE1_CONCURRENCY) || 8); // codex default = 8
 const MIN_ROLLOUT_IDLE_MS = (process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS === undefined ? 6 : Number(process.env.PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS)) * 3600 * 1000; // codex default 6h; explicit 0 disables the idle gate
 const MAX_UNUSED_DAYS = Math.max(1, Number(process.env.PI_MEMORY_MAX_UNUSED_DAYS) || 30); // codex default = 30
@@ -64,7 +69,14 @@ function openDb() {
 	db.exec("PRAGMA busy_timeout=5000;");
 	db.exec("PRAGMA journal_mode=WAL;");
 	db.exec(SCHEMA);
-	try { db.exec("ALTER TABLE stage1_outputs ADD COLUMN generated_at INTEGER"); } catch { /* already migrated */ }
+	for (const sql of [
+		"ALTER TABLE stage1_outputs ADD COLUMN generated_at INTEGER",
+		"ALTER TABLE stage1_outputs ADD COLUMN rollout_path TEXT",
+		"ALTER TABLE stage1_outputs ADD COLUMN selected_for_phase2 INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE stage1_outputs ADD COLUMN selected_for_phase2_source_updated_at INTEGER",
+	]) {
+		try { db.exec(sql); } catch { /* already migrated */ }
+	}
 	db.exec(`CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
 }
 
@@ -246,8 +258,9 @@ function claimPhase2() {
 	}
 	if (row.status === "completed") {
 		const lastSuccess = kvGet("phase2_last_success_at", 0);
-		const latestSource = db.prepare(`SELECT COALESCE(MAX(source_updated_at), 0) AS m FROM stage1_outputs`).get().m;
-		if (lastSuccess <= cooldownCutoff && latestSource > (row.input_watermark ?? 0)) {
+		if (lastSuccess <= cooldownCutoff) {
+			// Codex claims after cooldown and lets the materialized git workspace,
+			// rather than a DB watermark, decide whether consolidation has work.
 			db.prepare(`UPDATE jobs SET status='pending', lease_until=NULL, finished_at=NULL WHERE kind=? AND job_key=?`).run(P2_KIND, P2_KEY);
 			return { outcome: "recycled" };
 		}
@@ -259,20 +272,43 @@ function claimPhase2() {
 function markPhase2Failed(row, errMsg) {
 	debug("markPhase2Failed row:", JSON.stringify(row));
 	db.prepare(
-		`UPDATE jobs SET status='failed', last_error=?, retry_until=?, retry_remaining=retry_remaining-1, lease_until=NULL
-       WHERE kind=? AND job_key=? AND ownership_token=?`,
-	).run(String(errMsg).slice(0, 2000), Date.now() + RETRY_DELAY_MS, P2_KIND, P2_KEY, row.ownership_token);
+		`UPDATE jobs SET status='failed', finished_at=?, last_error=?, retry_until=?,
+		 retry_remaining=MAX(retry_remaining-1, 0), lease_until=NULL
+       WHERE kind=? AND job_key=? AND status='running' AND ownership_token=?`,
+	).run(Date.now(), String(errMsg).slice(0, 2000), Date.now() + RETRY_DELAY_MS, P2_KIND, P2_KEY, row.ownership_token);
 }
 
-function markPhase2Completed(row) {
+function heartbeatPhase2(row) {
+	return db.prepare(
+		`UPDATE jobs SET lease_until=? WHERE kind=? AND job_key=? AND status='running' AND ownership_token=?`,
+	).run(Date.now() + LEASE_MS, P2_KIND, P2_KEY, row.ownership_token).changes > 0;
+}
+
+function markPhase2Completed(row, selected) {
 	debug("markPhase2Completed row:", JSON.stringify(row));
 	const now = Date.now();
-	db.prepare(
-		`UPDATE jobs SET status='completed', finished_at=?, lease_until=NULL WHERE kind=? AND job_key=? AND ownership_token=?`,
-	).run(now, P2_KIND, P2_KEY, row.ownership_token);
-	kvSet("phase2_last_success_at", now);
-	const latestSource = db.prepare(`SELECT COALESCE(MAX(source_updated_at), 0) AS m FROM stage1_outputs`).get().m;
-	kvSet(P2_WATERMARK, latestSource);
+	const latestSource = selected.reduce((max, memory) => Math.max(max, Number(memory.source_updated_at) || 0), Number(row.input_watermark) || 0);
+	db.exec("BEGIN IMMEDIATE");
+	try {
+		const updated = db.prepare(
+			`UPDATE jobs SET status='completed', finished_at=?, lease_until=NULL,
+			 last_success_watermark=MAX(COALESCE(last_success_watermark, 0), ?)
+			 WHERE kind=? AND job_key=? AND status='running' AND ownership_token=?`,
+		).run(now, latestSource, P2_KIND, P2_KEY, row.ownership_token);
+		if (updated.changes === 0) throw new Error("lost global phase2 ownership before completion");
+		db.prepare(`UPDATE stage1_outputs SET selected_for_phase2=0, selected_for_phase2_source_updated_at=NULL`).run();
+		const markSelected = db.prepare(
+			`UPDATE stage1_outputs SET selected_for_phase2=1, selected_for_phase2_source_updated_at=?
+			 WHERE session_id=? AND source_updated_at=?`,
+		);
+		for (const memory of selected) markSelected.run(memory.source_updated_at, memory.session_id, memory.source_updated_at);
+		db.prepare(`INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run("phase2_last_success_at", String(now));
+		db.prepare(`INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(P2_WATERMARK, String(latestSource));
+		db.exec("COMMIT");
+	} catch (error) {
+		db.exec("ROLLBACK");
+		throw error;
+	}
 }
 
 // ---- phase-1 executor ----
@@ -302,7 +338,7 @@ function memoryChildEnv() {
 }
 
 function runPhase1WithPi(prompt) {
-	const modelSpec = cfg.llm?.phase2Model || cfg.llm?.model;
+	const modelSpec = cfg.llm?.model;
 	const args = phase1PiArgs(modelSpec);
 	return new Promise((resolve, reject) => {
 		const child = spawn("pi", args, { env: memoryChildEnv(), cwd: cfg.memDir, stdio: ["pipe", "pipe", "pipe"] });
@@ -380,12 +416,13 @@ async function runPhase1(row) {
 	const sourceUpdatedAt = Number(row.input_watermark) || Date.now(); // codex: source_updated_at = input watermark
 	const cwd = typeof rolloutCwd === "string" ? rolloutCwd : "";
 	db.prepare(
-		`INSERT INTO stage1_outputs (session_id, source_updated_at, raw_memory, rollout_summary, generated_at, rollout_slug, cwd, usage_count, last_usage)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)
+		`INSERT INTO stage1_outputs (session_id, source_updated_at, raw_memory, rollout_summary, generated_at, rollout_slug, cwd, rollout_path, usage_count, last_usage)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
      ON CONFLICT(session_id) DO UPDATE SET source_updated_at=excluded.source_updated_at, raw_memory=excluded.raw_memory,
        rollout_summary=excluded.rollout_summary, generated_at=excluded.generated_at,
-       rollout_slug=excluded.rollout_slug, cwd=excluded.cwd`,
-	).run(sessionId, sourceUpdatedAt, rawMemory, rolloutSummary, Date.now(), rolloutSlug, cwd);
+       rollout_slug=excluded.rollout_slug, cwd=excluded.cwd, rollout_path=excluded.rollout_path`,
+	).run(sessionId, sourceUpdatedAt, rawMemory, rolloutSummary, Date.now(), rolloutSlug, cwd,
+		typeof payload.rolloutPath === "string" ? payload.rolloutPath : "");
 	debug(`phase1 done: ${sessionId} -> stage1_outputs (watermark ${sourceUpdatedAt})`);
 	// phase-1 success advances the phase-2 watermark (codex: enqueue_global_consolidation)
 	enqueuePhase2();
@@ -401,69 +438,97 @@ async function runPhase1(row) {
 // - resetMemoryBaseline() commits a fresh baseline after a successful
 //   consolidation (codex: reset_memory_workspace_baseline)
 function git(cmd) {
-	const { execSync } = require("node:child_process");
-	return execSync(`git -C "${cfg.memDir}" ${cmd}`, { encoding: "utf8", timeout: 10000 });
+	const { execFileSync } = require("node:child_process");
+	return execFileSync("git", ["-C", cfg.memDir, ...cmd], { encoding: "utf8", timeout: 10000 });
+}
+
+function resetGitRepository() {
+	fs.rmSync(path.join(cfg.memDir, ".git"), { force: true, recursive: true });
+	git(["init", "-q"]);
+	git(["config", "user.name", "pi-memory"]);
+	git(["config", "user.email", "pi-memory@localhost"]);
+	git(["add", "-A"]);
+	git(["commit", "--allow-empty", "-qm", "memory baseline"]);
 }
 
 function prepareMemoryWorkspace() {
-	const gitDir = path.join(cfg.memDir, ".git");
+	if (fs.existsSync(cfg.memDir) && fs.lstatSync(cfg.memDir).isSymbolicLink()) {
+		throw new Error(`memory root cannot be a symbolic link: ${cfg.memDir}`);
+	}
+	ensureLayout();
+	removeMemorySymlinks(cfg.memDir);
+	fs.rmSync(path.join(cfg.memDir, PHASE2_WORKSPACE_DIFF_FILE), { force: true });
 	const gitignore = path.join(cfg.memDir, ".gitignore");
+	const requiredIgnores = ["memory.db", "memory.db-wal", "memory.db-shm", "worker.log"];
+	const existingIgnores = fs.existsSync(gitignore) ? fs.readFileSync(gitignore, "utf8").split(/\r?\n/) : [];
+	const mergedIgnores = [...existingIgnores.filter(Boolean)];
+	for (const entry of requiredIgnores) if (!mergedIgnores.includes(entry)) mergedIgnores.push(entry);
+	fs.writeFileSync(gitignore, `${mergedIgnores.join("\n")}\n`);
 	try {
-		if (!fs.existsSync(gitignore)) {
-			fs.writeFileSync(gitignore, "memory.db\nmemory.db-wal\nmemory.db-shm\n");
-		}
-		if (!fs.existsSync(gitDir)) {
-			git("init -q");
-			git('config user.name "pi-memory"');
-			git('config user.email "pi-memory@localhost"');
-			git("add -A");
-			git('commit -qm "baseline"');
-			log("memory workspace git baseline initialized");
-		}
-	} catch (err) {
-		log("git baseline init failed:", err.message);
+		git(["rev-parse", "--verify", "HEAD"]);
+	} catch {
+		resetGitRepository();
+		log("memory workspace git baseline initialized");
 	}
 }
 
-function workspaceHasChanges() {
-	try {
-		if (!fs.existsSync(path.join(cfg.memDir, ".git"))) return true; // no git → assume work exists
-		return git("status --porcelain").trim().length > 0;
-	} catch {
-		return true;
+function memoryWorkspaceDiff() {
+	fs.rmSync(path.join(cfg.memDir, PHASE2_WORKSPACE_DIFF_FILE), { force: true });
+	const status = git(["status", "--porcelain", "--untracked-files=all"]);
+	let unifiedDiff = git(["diff", "--no-ext-diff", "--binary", "HEAD", "--", "."]);
+	for (const line of status.split("\n")) {
+		if (!line.startsWith("?? ")) continue;
+		const relative = line.slice(3);
+		const absolute = path.join(cfg.memDir, relative);
+		if (!fs.existsSync(absolute) || !fs.statSync(absolute).isFile()) continue;
+		const content = fs.readFileSync(absolute, "utf8");
+		unifiedDiff += `diff --git a/${relative} b/${relative}\nnew file mode 100644\n--- /dev/null\n+++ b/${relative}\n@@ -0,0 +1,${content.split("\n").length} @@\n`;
+		unifiedDiff += content.split("\n").map((entry) => `+${entry}`).join("\n") + "\n";
 	}
+	return { status, unifiedDiff, hasChanges: status.trim().length > 0 };
+}
+
+function writeWorkspaceDiff(diff) {
+	let rendered = "# Memory Workspace Diff\n\nGenerated by pi before Phase 2 memory consolidation. Read this file first and do not edit it.\n\n## Status\n";
+	if (!diff.hasChanges) rendered += "- none\n";
+	else {
+		for (const line of diff.status.trimEnd().split("\n")) rendered += `- ${line}\n`;
+		rendered += "\n## Diff\n\n```diff\n";
+		const bounded = Buffer.byteLength(diff.unifiedDiff) <= PHASE2_WORKSPACE_DIFF_MAX_BYTES
+			? diff.unifiedDiff
+			: Buffer.from(diff.unifiedDiff).subarray(0, PHASE2_WORKSPACE_DIFF_MAX_BYTES).toString("utf8").replace(/\uFFFD$/, "")
+				+ `\n[workspace diff truncated at ${PHASE2_WORKSPACE_DIFF_MAX_BYTES} bytes]\n`;
+		rendered += bounded + (bounded.endsWith("\n") ? "" : "\n") + "```\n";
+	}
+	fs.writeFileSync(path.join(cfg.memDir, PHASE2_WORKSPACE_DIFF_FILE), rendered);
+}
+
+function removeMemorySymlinks(root) {
+	let removed = 0;
+	for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+		const target = path.join(root, entry.name);
+		if (entry.isSymbolicLink()) { fs.rmSync(target, { force: true, recursive: false }); removed++; }
+		else if (entry.isDirectory()) removed += removeMemorySymlinks(target);
+	}
+	return removed;
+}
+
+function validateConsolidationArtifacts() {
+	const removed = removeMemorySymlinks(cfg.memDir);
+	if (removed > 0) throw new Error(`removed ${removed} symbolic links from consolidated memory workspace`);
+	const memoryPath = path.join(cfg.memDir, "MEMORY.md");
+	if (!fs.existsSync(memoryPath) || !fs.statSync(memoryPath).isFile()) throw new Error("MEMORY.md is missing or not a file");
+	const summaryPath = path.join(cfg.memDir, "memory_summary.md");
+	if (!fs.existsSync(summaryPath) || !fs.statSync(summaryPath).isFile()) throw new Error("memory_summary.md is missing or not a file");
+	if (fs.readFileSync(summaryPath, "utf8").split(/\r?\n/, 1)[0] !== "v1") throw new Error("memory_summary.md does not start with v1");
 }
 
 function resetMemoryBaseline() {
-	try {
-		git("add -A");
-		git('commit -qm "consolidation baseline"');
-		log("memory workspace baseline reset");
-	} catch (err) {
-		log("git baseline commit failed:", err.message);
-	}
-}
-
-function phase2AgentPrompt(memDir) {
-	return [
-		`You are a Memory Writing Agent. Consolidate raw memories and rollout summaries into the local "agent memory" folder at ${memDir}.`,
-		``,
-		`Read these inputs with the read/grep tools (do not assume their contents):`,
-		`- ${memDir}/raw_memories.md   (merged phase-1 outputs; primary input)`,
-		`- ${memDir}/MEMORY.md          (existing handbook; update it)`,
-		`- ${memDir}/memory_summary.md  (existing summary; first line must stay exactly "v1")`,
-		`- ${path.join(memDir, "rollout_summaries")}/  (per-rollout recaps; open when needed)`,
-		`- ${path.join(memDir, "skills")}/  (reusable procedures; optional)`,
-		``,
-		`Then EDIT the files with the edit/write tools:`,
-		`1. MEMORY.md — durable handbook. Each block starts with "# Task Group: <cwd/project/workflow>" plus scope: and applies_to: lines; body has "## Task <n>" sections with "### rollout_summary_files" and "### keywords", then block-level "## User preferences" / "## Reusable knowledge" / "## Failures and how to do differently" when meaningful. Preserve original user wording, error strings, commands (grep-ability).`,
-		`2. memory_summary.md — must start exactly with "v1". Sections: "## User Profile" (<=350 words), "## User preferences" (actionable bullets), "## General Tips", "## What's in Memory" (routing index with keywords).`,
-		`3. Optionally create/update skills/ when there is a clearly reusable procedure.`,
-		``,
-		`Rules (STRICT): evidence-based only; redact secrets ([REDACTED_SECRET]); do not copy large tool outputs verbatim; if there is no meaningful new signal, make minimal or no changes; keep files dense and navigation-friendly.`,
-		``,
-		`Do not modify raw_memories.md or rollout_summaries/. When done, stop.`,
-	].join("\n");
+	fs.rmSync(path.join(cfg.memDir, PHASE2_WORKSPACE_DIFF_FILE), { force: true });
+	// Codex replaces .git rather than accumulating history, so deleted memory
+	// content is not retained in unreachable commits.
+	resetGitRepository();
+	log("memory workspace baseline reset");
 }
 
 const MAX_RAW_FOR_CONSOLIDATION = Math.max(1, Number(process.env.PI_MEMORY_MAX_RAW_CONSOLIDATION) || 256); // codex DEFAULT=256
@@ -485,7 +550,7 @@ function materializePhase2Inputs() {
 	const unusedCutoff = Date.now() - MAX_UNUSED_DAYS * 24 * 3600 * 1000;
 	const selected = db.prepare(
 		`SELECT * FROM stage1_outputs
-		 WHERE length(trim(raw_memory)) > 0 OR length(trim(rollout_summary)) > 0
+		 WHERE (length(trim(raw_memory)) > 0 OR length(trim(rollout_summary)) > 0)
 		   AND ((last_usage IS NOT NULL AND last_usage >= ?)
 		        OR (last_usage IS NULL AND source_updated_at >= ?))
 		 ORDER BY COALESCE(usage_count, 0) DESC,
@@ -493,12 +558,14 @@ function materializePhase2Inputs() {
 		          source_updated_at DESC, session_id DESC
 		 LIMIT ?`,
 	).all(unusedCutoff, unusedCutoff, MAX_RAW_FOR_CONSOLIDATION);
-	// Codex max_unused_days retention. The next workspace sync also prunes
-	// materialized rollout files no longer selected.
+	// Preserve the exact previous successful selection until a newer successful
+	// Phase 2 replaces it, matching Codex's retention baseline semantics.
 	db.prepare(
 		`DELETE FROM stage1_outputs
-		 WHERE (last_usage IS NOT NULL AND last_usage < ?)
-		    OR (last_usage IS NULL AND source_updated_at < ?)`,
+		 WHERE NOT (COALESCE(selected_for_phase2, 0) = 1
+		            AND selected_for_phase2_source_updated_at = source_updated_at)
+		   AND ((last_usage IS NOT NULL AND last_usage < ?)
+		        OR (last_usage IS NULL AND source_updated_at < ?))`,
 	).run(unusedCutoff, unusedCutoff);
 
 	// prune rollout summaries not in the selection (codex prune_rollout_summaries)
@@ -518,11 +585,11 @@ function materializePhase2Inputs() {
 		fs.writeFileSync(
 			path.join(dir, `${stem}.md`),
 			[
-				`# ${m.rollout_slug || "rollout"}`,
-				``,
-				`- session_id: ${m.session_id}`,
-				`- updated_at: ${new Date(Number(m.source_updated_at)).toISOString()}`,
-				`- cwd: ${m.cwd || ""}`,
+				`session_id: ${m.session_id}`,
+				`updated_at: ${new Date(Number(m.source_updated_at)).toISOString()}`,
+				`rollout_path: ${m.rollout_path || ""}`,
+				`cwd: ${m.cwd || ""}`,
+				...(m.git_branch ? [`git_branch: ${m.git_branch}`] : []),
 				``,
 				m.rollout_summary || "",
 				``,
@@ -537,45 +604,59 @@ function materializePhase2Inputs() {
 		body += "Merged stage-1 raw memories (stable ascending session-id order):\n\n";
 		const asc = [...selected].sort((a, b) => (a.session_id < b.session_id ? -1 : a.session_id > b.session_id ? 1 : 0));
 		for (const m of asc) {
-			body += `## Session \`${m.session_id}\` (${new Date(Number(m.source_updated_at)).toISOString()})\n\n`;
+			body += `## Session \`${m.session_id}\`\n`;
 			body += `updated_at: ${new Date(Number(m.source_updated_at)).toISOString()}\n`;
-			if (m.cwd) body += `cwd: ${m.cwd}\n`;
+			body += `cwd: ${m.cwd || ""}\n`;
+			body += `rollout_path: ${m.rollout_path || ""}\n`;
 			body += `rollout_summary_file: rollout_summaries/${rolloutStem(m)}.md\n\n`;
 			body += (m.raw_memory || "").trim() + "\n\n";
 		}
 	}
 	fs.writeFileSync(path.join(cfg.memDir, "raw_memories.md"), body);
 	log(`phase2 inputs materialized: ${selected.length} stage1_outputs -> rollout_summaries/ + raw_memories.md`);
+	return selected;
+}
+
+function resolvePhase2ProviderExtension(modelSpec) {
+	if (typeof modelSpec !== "string" || !modelSpec.startsWith("traex/")) return undefined;
+	const searchRoot = path.join(process.env.HOME || "", ".pi", "agent", "npm", "node_modules");
+	try {
+		return require.resolve("@bytedance-dev/pi-provider-traex", { paths: [searchRoot] });
+	} catch (error) {
+		throw new Error(`cannot resolve TraeX provider extension: ${error.message}`);
+	}
 }
 
 async function runPhase2AsAgent(row) {
-	// Codex: first materialize phase-1 DB outputs into the workspace, then the
-	// git diff decides whether consolidation has work.
-	materializePhase2Inputs();
-	if (!workspaceHasChanges()) {
-		debug("phase2: no workspace changes since last consolidation; skipping LLM");
-		markPhase2Completed(row);
-		return;
+	prepareMemoryWorkspace();
+	const selected = materializePhase2Inputs();
+	const workspaceDiff = memoryWorkspaceDiff();
+	if (!workspaceDiff.hasChanges) {
+		try {
+			validateConsolidationArtifacts();
+			debug("phase2: no workspace changes and artifacts are valid; skipping LLM");
+			markPhase2Completed(row, selected);
+			return;
+		} catch (error) {
+			debug("phase2: clean workspace has invalid artifacts; running agent:", error.message);
+		}
 	}
+	writeWorkspaceDiff(workspaceDiff);
 
-	// Model selection for the consolidation agent: prefer explicit env, else derived from worker llm config
 	const modelSpec = cfg.llm.phase2Model || cfg.llm.model;
-	const prompt = phase2AgentPrompt(cfg.memDir);
-
+	const prompt = phase2Prompt(cfg.memDir);
 	const env = {
 		...process.env,
 		PI_MEMORY_DIR: cfg.memDir,
-		PI_MEMORY_AUTO: "0",        // child must not enqueue new jobs (no loops)
-		PI_MEMORY_RECALL: "0",      // no recall injection in the child
-		PI_MEMORY_AGENT_CHILD: "1", // child must not fork its own worker (no chain)
+		PI_MEMORY_AUTO: "0",
+		PI_MEMORY_RECALL: "0",
+		PI_MEMORY_AGENT_CHILD: "1",
+		PI_SKIP_VERSION_CHECK: "1",
 	};
-	// Codex runs consolidation as a restricted internal worker. pi does not yet
-	// expose a filesystem-root sandbox here, but we can remove every extension,
-	// skill, shell and network-capable tool and limit the child to local memory
-	// workspace editing primitives.
-	const args = ["--print", "--no-extensions", "--no-skills", "--tools", "read,grep,edit,write"];
-	if (modelSpec) args.push("--model", modelSpec);
-	args.push(prompt);
+	// Auto-discovery stays disabled. Load only the selected custom provider;
+	// TraeX is an extension provider, while built-in providers need no entry.
+	const providerExtension = resolvePhase2ProviderExtension(modelSpec);
+	const args = phase2PiArgs(modelSpec, prompt, providerExtension);
 
 	log(`phase2: spawning restricted pi agent (model=${modelSpec})`);
 	const child = spawn("pi", args, { env, cwd: cfg.memDir, stdio: ["ignore", "pipe", "pipe"] });
@@ -583,35 +664,52 @@ async function runPhase2AsAgent(row) {
 	let stderr = "";
 	let settled = false;
 	const result = await new Promise((resolve) => {
-		const timer = setTimeout(() => {
-			if (!settled) {
-				settled = true;
-				child.kill("SIGKILL");
-				resolve({ ok: false, error: "phase2 agent timed out" });
-			}
-		}, PHASE2_AGENT_TIMEOUT_MS);
-		child.stdout.on("data", (d) => { stdout += d; });
-		child.stderr.on("data", (d) => { stderr += d; });
-		child.on("error", (err) => {
-			if (!settled) { settled = true; clearTimeout(timer); resolve({ ok: false, error: String(err) }); }
-		});
-		child.on("exit", (code) => {
+		const finish = (value) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
-			const memoryChanged = fs.existsSync(path.join(cfg.memDir, "MEMORY.md")) && fs.existsSync(path.join(cfg.memDir, "memory_summary.md"));
-			if (code === 0 && memoryChanged) resolve({ ok: true, stdout: stdout.slice(-2000) });
-			else resolve({ ok: false, error: `pi exited ${code}: ${stderr.slice(-500) || stdout.slice(-500)}` });
+			clearInterval(heartbeat);
+			resolve(value);
+		};
+		const timer = setTimeout(() => {
+			child.kill("SIGKILL");
+			finish({ ok: false, error: "phase2 agent timed out" });
+		}, PHASE2_AGENT_TIMEOUT_MS);
+		const heartbeat = setInterval(() => {
+			try {
+				if (!heartbeatPhase2(row)) {
+					child.kill("SIGKILL");
+					finish({ ok: false, error: "lost global phase2 ownership during heartbeat" });
+				}
+			} catch (error) {
+				child.kill("SIGKILL");
+				finish({ ok: false, error: `phase2 heartbeat failed: ${error.message}` });
+			}
+		}, PHASE2_HEARTBEAT_MS);
+		heartbeat.unref?.();
+		child.stdout.on("data", (d) => { stdout += d; });
+		child.stderr.on("data", (d) => { stderr = (stderr + d).slice(-4000); });
+		child.on("error", (error) => finish({ ok: false, error: String(error) }));
+		child.on("exit", (code) => {
+			if (code === 0) finish({ ok: true, stdout: stdout.slice(-2000) });
+			else finish({ ok: false, error: `pi exited ${code}: ${stderr.slice(-500) || stdout.slice(-500)}` });
 		});
 	});
 
-	if (result.ok) {
-		log("phase2: consolidation agent finished");
-		resetMemoryBaseline(); // codex: reset_memory_workspace_baseline
-		markPhase2Completed(row);
-	} else {
+	if (!result.ok) {
 		log("phase2 agent failed:", result.error);
 		markPhase2Failed(row, result.error);
+		return;
+	}
+	try {
+		validateConsolidationArtifacts();
+		if (!heartbeatPhase2(row)) throw new Error("lost global phase2 ownership before resetting workspace baseline");
+		resetMemoryBaseline();
+		markPhase2Completed(row, selected);
+		log("phase2: consolidation agent finished");
+	} catch (error) {
+		log("phase2 validation/finalization failed:", error.message);
+		markPhase2Failed(row, error.message);
 	}
 }
 
@@ -712,7 +810,8 @@ function startLoop() {
 	if (!heartbeatCoordinator()) return;
 	coordinatorTimer = setInterval(heartbeatCoordinator, Math.max(1000, Number(coordinator.heartbeatMs) || 10_000));
 	coordinatorTimer.unref?.();
-	prepareMemoryWorkspace(); // baseline must exist BEFORE phase-1 writes (codex: prepare_memory_workspace at startup)
+	try { prepareMemoryWorkspace(); } // baseline must exist BEFORE phase-1 writes
+	catch (error) { log("memory workspace baseline preparation failed:", error.message); }
 	// Codex is event-driven (work is spawned per turn), so a fixed fast poll
 	// wastes cycles — especially with the 6h idle gate. Sleep until the next
 	// actionable job: after a busy poll poll again soon (work may chain),

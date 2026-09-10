@@ -1,37 +1,29 @@
-# Plan: pi-memory 全局 worker 协调（approved 2026-09-09）
+# Plan: 严格对齐 Codex Memory Phase 1 / Phase 2 / Recall P0（approved 2026-09-10）
 
 ## Files that change
-- 修改 `packages/memory/lib/memory-core.cjs` 与 `.d.cts`：增加 SQLite 全局 worker lease 的 claim、heartbeat、release、inspect。
-- 修改 `packages/memory/extensions/memory.ts`：启动 worker 前竞争全局 lease；非 leader 不 fork；状态展示全局 owner。
-- 修改 `packages/memory/worker/worker.cjs`：按 coordinator token heartbeat，失权停止接活并退出，退出时安全释放。
-- 修改 `tests/memory-core.test.mjs`：覆盖并发 claim、有效 lease拒绝、过期接管、旧 token 隔离和主动释放。
-- 将 memory DB 语义从 Codex 的 `thread_id/threadId` 统一为 pi 的 `session_id/sessionId`；按用户要求不保留旧 DB 兼容性并删除现有 DB 数据。
-- 新增 `sessions` 索引表（一条 pi session/rollout JSONL 一行）；每轮只 UPSERT 当前 session，并从 DB 查询其他 idle session，不再重复扫描和解析全部 JSONL。
-- Phase 1 输入预算改为当前模型 `contextWindow` 的 70%；缺失时回退 150,000 tokens，并使用 pi 的 `ceil(chars / 4)` 估算做首尾截断。
-- Phase 1 模型调用改由受控 `pi --print` 子进程执行，使用当前 provider/model 的原生 runtime、鉴权和协议；不再硬编码 `/chat/completions`。
+- 保留 `packages/memory/prompts/stage_one_system.md` 与 `consolidation.md`：Codex Phase 1/2 prompt 原样副本。
+- 新增 `packages/memory/prompts/read_path.md`：Codex recall developer-policy prompt 原样副本。
+- 修改 `packages/memory/lib/memory-core.cjs` 与 `.d.cts`：增加 recall prompt 渲染、2,500-token 头部截断、memory citation 提取/剥离、完整 session ID usage 更新等可测试纯逻辑。
+- 修改 `packages/memory/extensions/memory.ts`：通过 `before_agent_start.systemPrompt` 动态注入 recall，不再写持久化 custom/user message；在最终 assistant message 上剥离 citation 并更新 usage。
+- 修改 `tests/memory-core.test.mjs`：覆盖模板一致性、summary 截断、system prompt 拼接、citation 解析/剥离、完整 ID 去重与 usage 更新。
+- 保留当前 Phase 1/2 默认 `traex/DeepSeek-V4-Flash`、provider-only 加载、workspace diff、heartbeat、artifact validation 和 worker.log ignore。
 
 ## Order of work
-1. 在 SQLite 新增独立 `worker_leases` 表和 token-safe core API。
-2. Extension 在 session start 和 enqueue 后尝试 leader claim；仅 winner fork worker。
-3. Worker 收到有效 token 后运行，定期 heartbeat；失去 ownership 后停止并退出。
-4. 正常 shutdown、signal 和 parent disconnect 时按 token 释放 lease。
-5. `/memory` 显示全局 leader，而不是只显示当前进程的局部 child 状态。
-6. 统一源码、schema、payload 和物化文件中的 session 命名，验证新空库 schema。
-7. 不做历史 backfill；只索引启用新版本后实际启动/settled 的 pi session，worker 只用 DB 索引选候选。
-8. 将 Phase 1 固定字符预算替换为 context-window token 预算，移除 `PI_MEMORY_ROLLOUT_CHARS`。
-9. Phase 1 通过 `pi --print --no-session --no-tools --no-skills --no-context-files` 调用当前 provider runtime，并设置 memory child 防递归环境。
-10. 运行单测、跨进程竞争测试和 extension 回归；停止旧 worker 后删除现有 DB/WAL/SHM。
+1. 原样同步 Codex `read_path.md` 到发布包，渲染 `base_path` 与截断后的 `memory_summary`。
+2. 将 recall 默认摘要预算从 4,000 改为 Codex 的 2,500 tokens，并使用 pi 的保守 `ceil(chars/4)` 语义做安全头部截断。
+3. `before_agent_start` 返回链式 `systemPrompt`，不再返回持久化 custom message。
+4. 实现 `<oai-mem-citation>` 解析和从 assistant 可见文本剥离；兼容 `<thread_ids>`，只接受完整 UUID session ID。
+5. 在 `message_end` 处理最终 assistant 文本，按 citation rollout IDs 精确更新 `stage1_outputs.usage_count/last_usage`，不再以 read-start 或 8 位前缀作为 retention usage。
+6. 增加单测，运行完整测试、prompt 字节一致性和 diff 检查。
 
 ## Risks
-- Leader 交接最危险：旧 worker 延迟退出时不能继续 claim jobs，也不能释放新 owner 的 lease。
-- 已运行的旧版 worker不认识新 lease；部署后需关闭旧 pi 进程并 `/reload` 或重启。
-- 第一个成功 claim 的 session 提供全局 worker 的模型配置；其他 session 不再各启 worker。
-- 不采用 PID 文件：PID 可复用，异常退出和不同 DB 路径下难以可靠回收；SQLite lease 与现有 job ownership 模型一致。
+- pi 没有 Codex 独立 developer-policy slot；使用 `before_agent_start` 的链式 system prompt 是 pi 可提供的最高优先级等价机制。
+- 修改 finalized assistant message 必须保留 role、usage、provider、tool calls 等所有其他字段，只替换 text content。
+- Citation 可能跨多个 text block；解析时需要合并识别，同时避免破坏 thinking/toolCall 内容。
+- citation 中无合法完整 UUID 时仍剥离标记，但不更新任何 stage1 usage，避免模糊前缀误计数。
 
 ## Proof
+- `cmp packages/memory/prompts/read_path.md ~/ai/codex/codex-rs/ext/memories/templates/memories/read_path.md`
 - `npm test`
 - `git diff --check`
-- 多进程/多连接竞争：同一 DB 同时只有一个 claim winner。
-- 旧 token heartbeat/release 不能影响新 leader；lease 过期和主动释放后可接管。
-- 多个 pi session enqueue 时不再各自产生 active worker。
-- `/memory` 可观察全局 leader owner 和 lease deadline。
+- 隔离 pi 运行确认 recall 位于 system prompt、最终可见回复不含 `<oai-mem-citation>`，且 DB 只更新 citation 中的完整 session ID。
