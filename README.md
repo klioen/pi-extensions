@@ -1,6 +1,6 @@
 # pi-extensions
 
-Custom packages for the [pi coding agent](https://github.com/earendil-works/pi-mono). Two independent packages live here; install either one or both.
+Custom packages for the [pi coding agent](https://github.com/earendil-works/pi-mono). Packages are independently installable or available through the umbrella package.
 
 ## Packages
 
@@ -71,6 +71,18 @@ Phase-1 extraction runs through pi's provider runtime in an ephemeral, tool-free
 
 Config (env): `PI_MEMORY_DIR`, `PI_MEMORY_DB`, `PI_MEMORY_AUTO=0` (disable phase 1), `PI_MEMORY_RECALL=0` (disable injection), `PI_MEMORY_MIN_ROLLOUT_IDLE_HOURS` (default 6), `PI_MEMORY_MAX_ROLLOUT_AGE_DAYS` (default 10), `PI_MEMORY_SCAN_LIMIT` (default 5000), `PI_MEMORY_MAX_ROLLOUTS_PER_STARTUP` (default 2), `PI_MEMORY_PHASE1_CONCURRENCY` (default 8), `PI_MEMORY_MAX_UNUSED_DAYS` (default 30), `PI_MEMORY_MAX_RAW_CONSOLIDATION` (default 256), `PI_MEMORY_SUMMARY_TOKENS`.
 
+### pi-web — `packages/pi-web`
+
+Local **Control Deck** for Pi. It provides a responsive dark/light web UI for read-only session history, Skills management, static extension/package inventory, and controlled pi-memory Markdown editing.
+
+- Starts on `127.0.0.1:8787` by default with no access token; strict Host and same-origin checks protect the loopback-only control plane.
+- Use `/web open` to print the local URL; `/web status`, `/web start`, and `/web stop` manage it.
+- Project resources are included only when the current project is trusted.
+- Session JSONL, package installation, extension execution, memory SQLite, raw memories, and rollout summaries remain read-only in V1.
+- Config: `PI_WEB_HOST`, `PI_WEB_PORT`, `PI_WEB_AUTO_START=0`.
+
+Because pi-web exposes local conversation and memory data, keep it bound to loopback. Do not expose it directly to a LAN or the public internet.
+
 ## Install
 
 Single packages (local paths):
@@ -78,6 +90,7 @@ Single packages (local paths):
 ```
 pi install /path/to/pi-extensions/packages/web-access
 pi install /path/to/pi-extensions/packages/subagents
+pi install /path/to/pi-extensions/packages/pi-web
 ```
 
 Or both at once via the umbrella package:

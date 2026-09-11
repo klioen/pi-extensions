@@ -70,10 +70,10 @@ function openDb() {
 	db.exec("PRAGMA journal_mode=WAL;");
 	db.exec(SCHEMA);
 	for (const sql of [
-		"ALTER TABLE stage1_outputs ADD COLUMN generated_at INTEGER",
-		"ALTER TABLE stage1_outputs ADD COLUMN rollout_path TEXT",
-		"ALTER TABLE stage1_outputs ADD COLUMN selected_for_phase2 INTEGER NOT NULL DEFAULT 0",
-		"ALTER TABLE stage1_outputs ADD COLUMN selected_for_phase2_source_updated_at INTEGER",
+		"ALTER TABLE phase1_outputs ADD COLUMN generated_at INTEGER",
+		"ALTER TABLE phase1_outputs ADD COLUMN rollout_path TEXT",
+		"ALTER TABLE phase1_outputs ADD COLUMN selected_for_phase2 INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE phase1_outputs ADD COLUMN selected_for_phase2_source_updated_at INTEGER",
 	]) {
 		try { db.exec(sql); } catch { /* already migrated */ }
 	}
@@ -142,11 +142,11 @@ function claimPhase1Jobs() {
 		return row.input_watermark <= idleCutoff;
 	});
 	// Codex idempotency: skip jobs whose input_watermark is already covered by
-	// stage1_outputs.source_updated_at (SkippedUpToDate). A retried or duplicate
+	// phase1_outputs.source_updated_at (SkippedUpToDate). A retried or duplicate
 	// phase-1 job then marks completed without re-running the LLM.
 	const upToDate = rows.filter((row) => {
 		if (!row.input_watermark) return false;
-		const output = db.prepare(`SELECT source_updated_at FROM stage1_outputs WHERE session_id = ?`).get(row.job_key);
+		const output = db.prepare(`SELECT source_updated_at FROM phase1_outputs WHERE session_id = ?`).get(row.job_key);
 		return output && Number(output.source_updated_at) >= Number(row.input_watermark);
 	});
 	for (const row of upToDate) {
@@ -296,9 +296,9 @@ function markPhase2Completed(row, selected) {
 			 WHERE kind=? AND job_key=? AND status='running' AND ownership_token=?`,
 		).run(now, latestSource, P2_KIND, P2_KEY, row.ownership_token);
 		if (updated.changes === 0) throw new Error("lost global phase2 ownership before completion");
-		db.prepare(`UPDATE stage1_outputs SET selected_for_phase2=0, selected_for_phase2_source_updated_at=NULL`).run();
+		db.prepare(`UPDATE phase1_outputs SET selected_for_phase2=0, selected_for_phase2_source_updated_at=NULL`).run();
 		const markSelected = db.prepare(
-			`UPDATE stage1_outputs SET selected_for_phase2=1, selected_for_phase2_source_updated_at=?
+			`UPDATE phase1_outputs SET selected_for_phase2=1, selected_for_phase2_source_updated_at=?
 			 WHERE session_id=? AND source_updated_at=?`,
 		);
 		for (const memory of selected) markSelected.run(memory.source_updated_at, memory.session_id, memory.source_updated_at);
@@ -371,7 +371,7 @@ function runPhase1WithPi(prompt) {
 	});
 }
 
-// Codex phase-1 writes only to SQLite (stage1_outputs); rollout summary files
+// Codex phase-1 writes only to SQLite (phase1_outputs); rollout summary files
 // are materialized later by phase-2 (sync_rollout_summaries_from_memories).
 async function runPhase1(row) {
 	const payload = JSON.parse(row.payload);
@@ -400,13 +400,13 @@ async function runPhase1(row) {
 		debug(`phase1 ${row.job_key}: invalid LLM response (${String(raw).length} chars): ${redactSecrets(String(raw)).slice(0, 500)}`);
 		throw new Error(`phase1 LLM output unparseable or empty (response ${String(raw).length} chars after retry)`);
 	}
-	// Codex treats an incomplete stage1 result as no-output, not a retryable
+	// Codex treats an incomplete phase1 result as no-output, not a retryable
 	// failure. Normalize every SQLite-bound value so malformed optional fields
 	// can never pass undefined into node:sqlite.
 	const rawMemory = redactSecrets(typeof parsed.raw_memory === "string" ? parsed.raw_memory : "").trim();
 	const rolloutSummary = redactSecrets(typeof parsed.rollout_summary === "string" ? parsed.rollout_summary : "").trim();
 	if (!rawMemory || !rolloutSummary) {
-		debug(`phase1 ${row.job_key}: valid but empty/incomplete output; completing without stage1 row`);
+		debug(`phase1 ${row.job_key}: valid but empty/incomplete output; completing without phase1 row`);
 		return;
 	}
 	const rolloutSlug = typeof parsed.rollout_slug === "string" && parsed.rollout_slug.trim()
@@ -416,14 +416,14 @@ async function runPhase1(row) {
 	const sourceUpdatedAt = Number(row.input_watermark) || Date.now(); // codex: source_updated_at = input watermark
 	const cwd = typeof rolloutCwd === "string" ? rolloutCwd : "";
 	db.prepare(
-		`INSERT INTO stage1_outputs (session_id, source_updated_at, raw_memory, rollout_summary, generated_at, rollout_slug, cwd, rollout_path, usage_count, last_usage)
+		`INSERT INTO phase1_outputs (session_id, source_updated_at, raw_memory, rollout_summary, generated_at, rollout_slug, cwd, rollout_path, usage_count, last_usage)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
      ON CONFLICT(session_id) DO UPDATE SET source_updated_at=excluded.source_updated_at, raw_memory=excluded.raw_memory,
        rollout_summary=excluded.rollout_summary, generated_at=excluded.generated_at,
        rollout_slug=excluded.rollout_slug, cwd=excluded.cwd, rollout_path=excluded.rollout_path`,
 	).run(sessionId, sourceUpdatedAt, rawMemory, rolloutSummary, Date.now(), rolloutSlug, cwd,
 		typeof payload.rolloutPath === "string" ? payload.rolloutPath : "");
-	debug(`phase1 done: ${sessionId} -> stage1_outputs (watermark ${sourceUpdatedAt})`);
+	debug(`phase1 done: ${sessionId} -> phase1_outputs (watermark ${sourceUpdatedAt})`);
 	// phase-1 success advances the phase-2 watermark (codex: enqueue_global_consolidation)
 	enqueuePhase2();
 }
@@ -534,7 +534,7 @@ function resetMemoryBaseline() {
 const MAX_RAW_FOR_CONSOLIDATION = Math.max(1, Number(process.env.PI_MEMORY_MAX_RAW_CONSOLIDATION) || 256); // codex DEFAULT=256
 
 // Codex sync_rollout_summaries_from_memories + rebuild_raw_memories_file:
-// materialize the selected stage1_outputs (latest first, capped) into
+// materialize the selected phase1_outputs (latest first, capped) into
 // rollout_summaries/<stem>.md (one per thread; prune files no longer in the
 // selection) and rebuild raw_memories.md as the merged input for phase 2.
 function rolloutStem(m) {
@@ -549,7 +549,7 @@ function materializePhase2Inputs() {
 	// otherwise recent never-used outputs; then stable source/thread ordering.
 	const unusedCutoff = Date.now() - MAX_UNUSED_DAYS * 24 * 3600 * 1000;
 	const selected = db.prepare(
-		`SELECT * FROM stage1_outputs
+		`SELECT * FROM phase1_outputs
 		 WHERE (length(trim(raw_memory)) > 0 OR length(trim(rollout_summary)) > 0)
 		   AND ((last_usage IS NOT NULL AND last_usage >= ?)
 		        OR (last_usage IS NULL AND source_updated_at >= ?))
@@ -561,7 +561,7 @@ function materializePhase2Inputs() {
 	// Preserve the exact previous successful selection until a newer successful
 	// Phase 2 replaces it, matching Codex's retention baseline semantics.
 	db.prepare(
-		`DELETE FROM stage1_outputs
+		`DELETE FROM phase1_outputs
 		 WHERE NOT (COALESCE(selected_for_phase2, 0) = 1
 		            AND selected_for_phase2_source_updated_at = source_updated_at)
 		   AND ((last_usage IS NOT NULL AND last_usage < ?)
@@ -601,7 +601,7 @@ function materializePhase2Inputs() {
 	let body = "# Raw Memories\n\n";
 	if (selected.length === 0) body += "No raw memories yet.\n";
 	else {
-		body += "Merged stage-1 raw memories (stable ascending session-id order):\n\n";
+		body += "Merged phase-1 raw memories (stable ascending session-id order):\n\n";
 		const asc = [...selected].sort((a, b) => (a.session_id < b.session_id ? -1 : a.session_id > b.session_id ? 1 : 0));
 		for (const m of asc) {
 			body += `## Session \`${m.session_id}\`\n`;
@@ -613,7 +613,7 @@ function materializePhase2Inputs() {
 		}
 	}
 	fs.writeFileSync(path.join(cfg.memDir, "raw_memories.md"), body);
-	log(`phase2 inputs materialized: ${selected.length} stage1_outputs -> rollout_summaries/ + raw_memories.md`);
+	log(`phase2 inputs materialized: ${selected.length} phase1_outputs -> rollout_summaries/ + raw_memories.md`);
 	return selected;
 }
 

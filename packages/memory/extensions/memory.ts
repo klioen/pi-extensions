@@ -10,14 +10,14 @@
  *   raw_memories.md        merged phase-1 outputs (phase-2 input)
  *   rollout_summaries/     per-conversation distilled recaps
  *   skills/                optional reusable procedures (SKILL.md packages)
- *   memory.db              SQLite job queue (jobs + stage1_outputs tables)
+ *   memory.db              SQLite job queue (jobs + phase1_outputs tables)
  *
  * Pipeline:
  *   Phase 1 (per agent_settled): the extension only upserts the current pi
  *     session into SQLite and requests a scan. The global leader queries the
  *     indexed sessions table, creates bounded phase1 jobs, claims leases, calls
  *     the LLM via plain fetch (independent of the pi runtime), writes
- *     stage1_outputs + rollout_summaries/ + raw_memories.md.
+ *     phase1_outputs + rollout_summaries/ + raw_memories.md.
  *   Phase 2 (Codex-aligned): after each phase-1 success the worker advances a
  *     global 'memory_consolidate_global' singleton job watermark; the worker
  *     claims it only when the 6h success cooldown / 1h retry backoff allow,
@@ -81,10 +81,10 @@ function getDb(): DatabaseSync {
 		db.exec(memoryCore.SCHEMA);
 		// Safe forward migrations for databases created by earlier pi-memory builds.
 		for (const sql of [
-			"ALTER TABLE stage1_outputs ADD COLUMN generated_at INTEGER",
-			"ALTER TABLE stage1_outputs ADD COLUMN rollout_path TEXT",
-			"ALTER TABLE stage1_outputs ADD COLUMN selected_for_phase2 INTEGER NOT NULL DEFAULT 0",
-			"ALTER TABLE stage1_outputs ADD COLUMN selected_for_phase2_source_updated_at INTEGER",
+			"ALTER TABLE phase1_outputs ADD COLUMN generated_at INTEGER",
+			"ALTER TABLE phase1_outputs ADD COLUMN rollout_path TEXT",
+			"ALTER TABLE phase1_outputs ADD COLUMN selected_for_phase2 INTEGER NOT NULL DEFAULT 0",
+			"ALTER TABLE phase1_outputs ADD COLUMN selected_for_phase2_source_updated_at INTEGER",
 		]) {
 			try { db.exec(sql); } catch { /* already migrated */ }
 		}
@@ -100,7 +100,7 @@ function enqueueJobWithWatermark(kind: string, jobKey: string, inputWatermark: n
 	const d = getDb();
 	// Never replace a leased phase-1 job: doing so discards its ownership token
 	// and lets duplicate scans run the same rollout twice. This mirrors Codex's
-	// stage1_source_needs_update + atomic try_claim_stage1_job sequence.
+	// phase1_source_needs_update + atomic try_claim_phase1_job sequence.
 	if (kind === "phase1") {
 		return memoryCore.upsertPhase1Job(d, jobKey, inputWatermark, payload);
 	}

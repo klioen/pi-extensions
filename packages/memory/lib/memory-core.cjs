@@ -10,7 +10,7 @@ const path = require("node:path");
 // Vendored verbatim from Codex's Phase 1 memory-writing system prompt. Keep
 // this out of the user message so the rollout remains untrusted input data.
 const PHASE1_SYSTEM_PROMPT = fs.readFileSync(
-	path.join(__dirname, "..", "prompts", "stage_one_system.md"),
+	path.join(__dirname, "..", "prompts", "phase_one_system.md"),
 	"utf8",
 );
 const PHASE2_CONSOLIDATION_PROMPT = fs.readFileSync(
@@ -26,8 +26,25 @@ const PHASE2_WORKSPACE_DIFF_FILE = "phase2_workspace_diff.md";
 const PHASE2_WORKSPACE_DIFF_MAX_BYTES = 4 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// SQLite schema (mirrors codex-rs state/migrations jobs + stage1_outputs)
+// SQLite schema (mirrors codex-rs state/migrations jobs + phase1_outputs)
 // ---------------------------------------------------------------------------
+
+const PHASE_ONE_OUTPUTS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS phase1_outputs (
+    session_id TEXT PRIMARY KEY,
+    source_updated_at INTEGER NOT NULL,
+    raw_memory TEXT NOT NULL,
+    rollout_summary TEXT NOT NULL,
+    generated_at INTEGER,
+    rollout_slug TEXT,
+    cwd TEXT,
+    rollout_path TEXT,
+    git_branch TEXT,
+    usage_count INTEGER,
+    last_usage INTEGER,
+    selected_for_phase2 INTEGER NOT NULL DEFAULT 0,
+    selected_for_phase2_source_updated_at INTEGER
+);`;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS jobs (
@@ -48,21 +65,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_success_watermark INTEGER,
     PRIMARY KEY (kind, job_key)
 );
-CREATE TABLE IF NOT EXISTS stage1_outputs (
-    session_id TEXT PRIMARY KEY,
-    source_updated_at INTEGER NOT NULL,
-    raw_memory TEXT NOT NULL,
-    rollout_summary TEXT NOT NULL,
-    generated_at INTEGER,
-    rollout_slug TEXT,
-    cwd TEXT,
-    rollout_path TEXT,
-    git_branch TEXT,
-    usage_count INTEGER,
-    last_usage INTEGER,
-    selected_for_phase2 INTEGER NOT NULL DEFAULT 0,
-    selected_for_phase2_source_updated_at INTEGER
-);
+${PHASE_ONE_OUTPUTS_SCHEMA}
 CREATE TABLE IF NOT EXISTS worker_leases (
     lease_key TEXT PRIMARY KEY,
     owner_id TEXT NOT NULL,
@@ -255,7 +258,7 @@ function recordMemoryCitationUsage(db, sessionIds, now = Date.now()) {
 	const unique = [...new Set((sessionIds ?? []).filter((id) => typeof id === "string"))];
 	if (unique.length === 0) return 0;
 	const update = db.prepare(
-		`UPDATE stage1_outputs SET usage_count=COALESCE(usage_count, 0)+1, last_usage=? WHERE session_id=?`,
+		`UPDATE phase1_outputs SET usage_count=COALESCE(usage_count, 0)+1, last_usage=? WHERE session_id=?`,
 	);
 	let changed = 0;
 	for (const id of unique) changed += Number(update.run(now, id).changes);
@@ -403,11 +406,11 @@ function upsertPhase1Job(db, jobKey, inputWatermark, payload, now = Date.now()) 
 		 WHERE jobs.status IN ('pending','failed','completed')
 		   AND (
 		     COALESCE(excluded.input_watermark, 0) > COALESCE(jobs.input_watermark, 0)
-		     -- Retention may prune the stage1 row while the source rollout still
-		     -- exists. Codex stage1_source_needs_update treats that as eligible
+		     -- Retention may prune the phase1 row while the source rollout still
+		     -- exists. Codex phase1_source_needs_update treats that as eligible
 		     -- again even if the rollout watermark itself has not changed.
 		     OR (jobs.status='completed' AND NOT EXISTS (
-		       SELECT 1 FROM stage1_outputs AS so
+		       SELECT 1 FROM phase1_outputs AS so
 		       WHERE so.session_id=jobs.job_key
 		         AND so.source_updated_at >= COALESCE(jobs.input_watermark, 0)
 		     ))
@@ -464,7 +467,7 @@ function selectIdleSessions(db, currentSessionId, now, minIdleMs, maxAgeMs, limi
 		`SELECT s.session_id, s.rollout_path, s.updated_at, s.cwd
 		 FROM sessions AS s
 		 LEFT JOIN jobs AS j ON j.kind='phase1' AND j.job_key=s.session_id
-		 LEFT JOIN stage1_outputs AS so ON so.session_id=s.session_id
+		 LEFT JOIN phase1_outputs AS so ON so.session_id=s.session_id
 		 WHERE s.session_id != ?
 		   AND s.updated_at >= ?
 		   AND s.updated_at <= ?

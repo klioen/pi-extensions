@@ -1,7 +1,7 @@
 {
 	"name": "pi-extensions",
 	"version": "0.1.0",
-	"description": "Custom pi coding agent packages: env (.env loader), web-access, subagents, failover (multi-key), and memory (local markdown memory modeled after Codex).",
+	"description": "Custom pi coding agent packages, including web access, subagents, planning, memory, goals, and the Pi Web Control Deck.",
 	"type": "module",
 	"keywords": [
 		"pi-package"
@@ -15,7 +15,8 @@
 			"./packages/plan/extensions",
 			"./packages/failover/extensions",
 			"./packages/memory/extensions",
-			"./packages/loop/extensions"
+			"./packages/loop/extensions",
+			"./packages/pi-web/extensions"
 		]
 	},
 	"peerDependencies": {

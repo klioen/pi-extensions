@@ -5,7 +5,8 @@ Custom pi coding-agent packages. Root `package.json` exposes the umbrella runtim
 ## Project layout
 
 - `packages/env` — `.env` loader; keep it first when loading the umbrella package.
-- `packages/web-access`, `subagents`, `todo`, `plan`, `failover`, `memory`, `loop` — runtime extensions.
+- `packages/web-access`, `subagents`, `todo`, `plan`, `failover`, `memory`, `loop`, `pi-web` — runtime extensions.
+- `packages/pi-web` — loopback-only Control Deck for sessions, skills, extensions/packages, and memory.
 - `packages/plan` — owns the `/plan` and `/init` extensions.
 - `packages/sdlc` — reusable SDLC skills only.
 - `tests/*.test.mjs` — Node built-in `node:test` coverage for reusable core logic.
@@ -28,7 +29,7 @@ Custom pi coding-agent packages. Root `package.json` exposes the umbrella runtim
 
 - Project instructions live in `AGENTS.md`, never `CLAUDE.md`.
 - Packages are under `packages/<name>`; Node built-in `node:test` is the test framework.
-- Root runtime extension order is `env`, `web-access`, `subagents`, `todo`, `plan`, `failover`, `memory`, `loop`.
+- Root runtime extension order is `env`, `web-access`, `subagents`, `todo`, `plan`, `failover`, `memory`, `loop`, `pi-web`.
 - Runtime dependencies must be zero or declared in `dependencies`; pi core packages are peer-provided.
 - `pi-plan` owns `/plan` and `/init`; `pi-sdlc` ships reusable skills under `skills/`.
 

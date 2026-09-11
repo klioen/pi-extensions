@@ -1,0 +1,13 @@
+{
+  "name": "pi-web",
+  "version": "0.1.0",
+  "description": "Local Control Deck for pi sessions, skills, extensions, packages, and memory.",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

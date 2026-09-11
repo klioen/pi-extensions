@@ -41,15 +41,15 @@ import {
 	upsertPhase1Job,
 } from "../packages/memory/lib/memory-core.cjs";
 
-// --- SCHEMA：包含 jobs + stage1_outputs 表 ---
-test("SCHEMA defines jobs and stage1_outputs tables", () => {
+// --- SCHEMA：包含 jobs + phase1_outputs 表 ---
+test("SCHEMA defines jobs and phase1_outputs tables", () => {
 	assert.match(SCHEMA, /CREATE TABLE IF NOT EXISTS jobs/);
-	assert.match(SCHEMA, /CREATE TABLE IF NOT EXISTS stage1_outputs/);
+	assert.match(SCHEMA, /CREATE TABLE IF NOT EXISTS phase1_outputs/);
 	assert.match(SCHEMA, /CREATE TABLE IF NOT EXISTS worker_leases/);
 	assert.match(SCHEMA, /CREATE TABLE IF NOT EXISTS sessions/);
 	assert.match(SCHEMA, /CREATE INDEX IF NOT EXISTS idx_sessions_updated_at/);
 	assert.match(SCHEMA, /input_watermark INTEGER/); // codex watermark 幂等字段
-	assert.match(SCHEMA, /generated_at INTEGER/); // codex stage-1 audit timestamp
+	assert.match(SCHEMA, /generated_at INTEGER/); // codex phase-1 audit timestamp
 	assert.match(SCHEMA, /session_id TEXT PRIMARY KEY/);
 	assert.match(SCHEMA, /rollout_path TEXT/);
 	assert.match(SCHEMA, /selected_for_phase2 INTEGER NOT NULL DEFAULT 0/);
@@ -86,7 +86,7 @@ test("token-aware truncation preserves head and tail", () => {
 	assert.ok(estimateTextTokens(truncated) <= 20);
 });
 
-// --- phase1Prompt：只包含 Codex stage-one user input，规则由 system prompt 承载 ---
+// --- phase1Prompt：只包含 Codex phase-one user input，规则由 system prompt 承载 ---
 test("phase1Prompt matches the short Codex user-input shape", () => {
 	const prompt = phase1Prompt("hello world", "/tmp/rollout.jsonl", "/tmp");
 	assert.match(prompt, /hello world/);
@@ -138,10 +138,10 @@ test("assistant citation stripping preserves non-text content and records exact-
 	try {
 		const db = new DatabaseSync(join(dir, "memory.db"));
 		db.exec(SCHEMA);
-		const insert = db.prepare(`INSERT INTO stage1_outputs (session_id,source_updated_at,raw_memory,rollout_summary,usage_count) VALUES (?,?,?,?,0)`);
+		const insert = db.prepare(`INSERT INTO phase1_outputs (session_id,source_updated_at,raw_memory,rollout_summary,usage_count) VALUES (?,?,?,?,0)`);
 		insert.run(id, 1, "a", "a"); insert.run(other, 1, "b", "b");
 		assert.equal(recordMemoryCitationUsage(db, [id, id], 1234), 1);
-		const rows = db.prepare(`SELECT session_id,usage_count,last_usage FROM stage1_outputs ORDER BY session_id`).all();
+		const rows = db.prepare(`SELECT session_id,usage_count,last_usage FROM phase1_outputs ORDER BY session_id`).all();
 		assert.deepEqual(rows.map((row) => ({ ...row })), [
 			{ session_id: id, usage_count: 1, last_usage: 1234 },
 			{ session_id: other, usage_count: 0, last_usage: null },
@@ -297,7 +297,7 @@ test("idle query filters up-to-date sessions before applying its limit", () => {
 		for (let i = 1; i <= 5; i++) {
 			upsertPhase1Job(db, `done-${i}`, 800 + i, { rolloutPath: `/done-${i}.jsonl` }, 900);
 			db.prepare("UPDATE jobs SET status='completed' WHERE job_key=?").run(`done-${i}`);
-			db.prepare("INSERT INTO stage1_outputs (session_id,source_updated_at,raw_memory,rollout_summary) VALUES (?,?,?,?)").run(`done-${i}`, 800 + i, "m", "s");
+			db.prepare("INSERT INTO phase1_outputs (session_id,source_updated_at,raw_memory,rollout_summary) VALUES (?,?,?,?)").run(`done-${i}`, 800 + i, "m", "s");
 		}
 		assert.deepEqual(selectIdleSessions(db, "current", 1000, 100, 500, 2).map((row) => row.session_id), ["todo-2", "todo-1"]);
 	} finally {
@@ -393,7 +393,7 @@ test("upsertPhase1Job advances only completed/pending jobs with newer watermark"
 		db.exec(SCHEMA);
 		assert.equal(upsertPhase1Job(db, "session-1", 100, { v: 1 }, 1), true);
 		// Simulate a completed first extraction: same watermark is now idempotent.
-		db.prepare("INSERT INTO stage1_outputs (session_id, source_updated_at, raw_memory, rollout_summary) VALUES ('session-1', 100, 'm', 's')").run();
+		db.prepare("INSERT INTO phase1_outputs (session_id, source_updated_at, raw_memory, rollout_summary) VALUES ('session-1', 100, 'm', 's')").run();
 		db.prepare("UPDATE jobs SET status='completed'").run();
 		assert.equal(upsertPhase1Job(db, "session-1", 100, { v: 2 }, 2), false);
 		assert.equal(upsertPhase1Job(db, "session-1", 200, { v: 2 }, 2), true);
@@ -413,7 +413,7 @@ test("upsertPhase1Job requeues a completed rollout after retention prunes its ou
 		db.exec(SCHEMA);
 		assert.equal(upsertPhase1Job(db, "session-1", 100, { v: 1 }, 1), true);
 		db.prepare("UPDATE jobs SET status='completed'").run();
-		// No stage1_outputs row exists (retention deleted it): same source must requeue.
+		// No phase1_outputs row exists (retention deleted it): same source must requeue.
 		assert.equal(upsertPhase1Job(db, "session-1", 100, { v: 2 }, 2), true);
 		assert.match(db.prepare("SELECT payload FROM jobs").get().payload, /"v":2/);
 	} finally {
