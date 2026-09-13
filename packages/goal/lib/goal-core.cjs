@@ -1,5 +1,5 @@
 /**
- * Pure goal-domain logic for pi-loop. Plain CommonJS so the jiti-loaded
+ * Pure goal-domain logic for pi-goal. Plain CommonJS so the jiti-loaded
  * extension and node:test can both require it without TS transformation.
  */
 
@@ -19,7 +19,7 @@ function extractTokenUsage(event) {
 
 /**
  * Apply budget/limits after accounting. Mutates g.status; returns it.
- * maxTurns mirrors PI_LOOP_MAX_TURNS (default 20).
+ * maxTurns mirrors PI_GOAL_MAX_TURNS (default 20).
  */
 function enforceLimits(g, maxTurns = 20) {
 	if (g.status !== "active") return g.status;
@@ -48,7 +48,7 @@ function continuationMessage(g) {
 	const budget = g.tokenBudget !== null ? `${g.turns} turns / ${g.tokensUsed}/${g.tokenBudget} tokens` : `${g.turns} turns / ${g.tokensUsed} tokens`;
 	const time = g.timeUsedSeconds > 0 ? `, ${formatSeconds(g.timeUsedSeconds)} elapsed` : "";
 	return [
-		`## Goal continuation (pi-loop)`,
+		`## Goal continuation (pi-goal)`,
 		``,
 		`Keep working toward the active goal below. You are the agent in a loop; continue making progress autonomously.`,
 		`When the goal is achieved, call the update_goal tool with status "complete".`,

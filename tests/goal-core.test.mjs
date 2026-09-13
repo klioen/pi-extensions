@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
 	extractTokenUsage,
 	enforceLimits,
@@ -7,7 +10,7 @@ import {
 	formatSeconds,
 	continuationMessage,
 	parseGoalArgs,
-} from "../packages/loop/lib/goal-core.cjs";
+} from "../packages/goal/lib/goal-core.cjs";
 
 // --- extractTokenUsage：只算当轮增量，不算累计 totalTokens ---
 test("extractTokenUsage sums per-request deltas, not cumulative totals", () => {
@@ -98,4 +101,26 @@ test("parseGoalArgs: subcommands", () => {
 
 test("parseGoalArgs: set/edit with empty objective errors", () => {
 	assert.equal(parseGoalArgs("set").error, "objective required");
+});
+
+test("package uses only the pi-goal identity and configuration prefix", () => {
+	const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+	const retiredPackage = ["pi", "loop"].join("-");
+	const retiredDirectory = path.join(root, "packages", "loop");
+	const retiredConfigPrefix = ["PI", "LOOP"].join("_");
+	const files = [
+		"AGENTS.md",
+		"package.json",
+		"package-lock.json",
+		"packages/goal/package.json",
+		"packages/goal/extensions/goal.ts",
+		"packages/goal/lib/goal-core.cjs",
+	];
+
+	assert.equal(fs.existsSync(retiredDirectory), false);
+	for (const relativePath of files) {
+		const text = fs.readFileSync(path.join(root, relativePath), "utf8");
+		assert.equal(text.includes(retiredPackage), false, `${relativePath} contains the retired package name`);
+		assert.equal(text.includes(retiredConfigPrefix), false, `${relativePath} contains the retired config prefix`);
+	}
 });

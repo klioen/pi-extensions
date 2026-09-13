@@ -16,7 +16,7 @@
 			"./packages/lark/extensions",
 			"./packages/failover/extensions",
 			"./packages/memory/extensions",
-			"./packages/loop/extensions",
+			"./packages/goal/extensions",
 			"./packages/pi-web/extensions"
 		]
 	},

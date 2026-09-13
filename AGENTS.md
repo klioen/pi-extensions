@@ -5,7 +5,7 @@ Custom pi coding-agent packages. Root `package.json` exposes the umbrella runtim
 ## Project layout
 
 - `packages/env` — `.env` loader; keep it first when loading the umbrella package.
-- `packages/web-access`, `subagents`, `todo`, `plan`, `lark`, `failover`, `memory`, `loop`, `pi-web` — runtime extensions.
+- `packages/web-access`, `subagents`, `todo`, `plan`, `lark`, `failover`, `memory`, `goal`, `pi-web` — runtime extensions.
 - `packages/lark` — keeps `lark-*` skills hidden by default and exposes session-scoped `/lark` opt-in routing.
 - `packages/pi-web` — loopback-only React/TypeScript Control Deck for chat, sessions, skills, extensions/packages, disk usage, and memory; Vite source is under `src/`, committed runtime assets under `public/`.
 - `packages/plan` — owns the `/plan` and `/init` extensions.
@@ -36,7 +36,7 @@ Custom pi coding-agent packages. Root `package.json` exposes the umbrella runtim
 - Project instructions live in `AGENTS.md`, never `CLAUDE.md`.
 - All SDLC artifacts live under `docs/<change-slug>/{intent.md,spec.md,plan.md}`. A change slug is a stable kebab-case delivery unit; update its directory within one delivery cycle, but use a new slug for a new post-delivery objective, bugfix, or incident. Never create root artifact files or `plans/`/`intent/` artifact directories.
 - Packages are under `packages/<name>`; Node built-in `node:test` is the test framework.
-- Root runtime extension order is `env`, `web-access`, `subagents`, `todo`, `plan`, `lark`, `failover`, `memory`, `loop`, `pi-web`.
+- Root runtime extension order is `env`, `web-access`, `subagents`, `todo`, `plan`, `lark`, `failover`, `memory`, `goal`, `pi-web`.
 - Runtime dependencies must be zero or declared in `dependencies`; pi core packages are peer-provided. Pi Web frontend dependencies are bundled by Vite, and extension/server code must not import them at runtime.
 - `packages/pi-web/public/` is generated but committed because installed pi packages serve it without a frontend build step; never hand-edit its hashed assets.
 - `pi-plan` owns `/plan` and `/init`; `pi-sdlc` ships reusable skills under `skills/`.

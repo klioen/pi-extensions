@@ -1,5 +1,5 @@
 /**
- * pi-loop: persistent per-session goals for pi, modeled after Codex's /goal
+ * pi-goal: persistent per-session goals for pi, modeled after Codex's /goal
  * system (codex-rs/ext/goal). Storage mirrors codex: a `goals` table keyed
  * by session id (codex keys by thread id — in pi the session is the unit of
  * conversation, and each session carries its own goal), plus a
@@ -19,8 +19,8 @@
  * - deferral: writing a goal defers auto-continuation once; the next
  *   user-initiated turn clears it (codex thread_goal_continuation_deferrals)
  *
- * Guardrails: PI_LOOP_MAX_TURNS (default 20) → usage_limited;
- * unbudgeted goals default to PI_LOOP_MAX_GOAL_TOKEN_BUDGET (100000).
+ * Guardrails: PI_GOAL_MAX_TURNS (default 20) → usage_limited;
+ * unbudgeted goals default to PI_GOAL_MAX_GOAL_TOKEN_BUDGET (100000).
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -35,19 +35,19 @@ import * as path from "node:path";
 // Config
 // ---------------------------------------------------------------------------
 
-const DB_PATH = process.env.PI_LOOP_DB || path.join(os.homedir(), ".pi", "agent", "sqlite", "goal.db");
-const MAX_TURNS = Math.max(1, Number(process.env.PI_LOOP_MAX_TURNS) || 20);
+const DB_PATH = process.env.PI_GOAL_DB || path.join(os.homedir(), ".pi", "agent", "sqlite", "goal.db");
+const MAX_TURNS = Math.max(1, Number(process.env.PI_GOAL_MAX_TURNS) || 20);
 /**
  * Default token budget when the user/agent does not specify one. Mirrors
  * Codex's max_goal_token_budget: a goal without an explicit budget still
  * cannot run forever.
  */
-const DEFAULT_BUDGET = Math.max(1, Number(process.env.PI_LOOP_MAX_GOAL_TOKEN_BUDGET) || 100000);
-const ENABLED = process.env.PI_LOOP !== "0";
-const DEBUG = process.env.PI_LOOP_DEBUG === "1";
+const DEFAULT_BUDGET = Math.max(1, Number(process.env.PI_GOAL_MAX_GOAL_TOKEN_BUDGET) || 100000);
+const ENABLED = process.env.PI_GOAL !== "0";
+const DEBUG = process.env.PI_GOAL_DEBUG === "1";
 
 function debug(...args: unknown[]): void {
-	if (DEBUG) console.error("[pi-loop]", ...args);
+	if (DEBUG) console.error("[pi-goal]", ...args);
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +199,7 @@ function kickoffTurn(pi: ExtensionAPI, sessionId: string): void {
 	if (!g) return;
 	pi.sendMessage(
 		{
-			customType: "pi-loop-continue",
+			customType: "pi-goal-continue",
 			content: goalCore.continuationMessage(g),
 			display: false,
 		},
@@ -234,7 +234,7 @@ export default function (pi: ExtensionAPI) {
 			if (!g || g.status !== "active") return;
 			return {
 				message: {
-					customType: "pi-loop-steering",
+					customType: "pi-goal-steering",
 					content: goalCore.continuationMessage(g),
 					display: false,
 				},
@@ -260,7 +260,7 @@ export default function (pi: ExtensionAPI) {
 			g.updatedAt = Date.now();
 			saveGoal(g);
 			if (g.status !== "active") {
-				ctx.ui.notify(`pi-loop: goal ${goalCore.statusLabel(g.status)} (${g.turns} turns, ${g.tokensUsed} tokens)`, "info");
+				ctx.ui.notify(`pi-goal: goal ${goalCore.statusLabel(g.status)} (${g.turns} turns, ${g.tokensUsed} tokens)`, "info");
 			}
 		} catch {
 			/* never break */
@@ -403,7 +403,7 @@ export default function (pi: ExtensionAPI) {
 	// ------------------------------------------------------------------
 	pi.registerCommand("goal", {
 		description:
-			"pi-loop: /goal [<objective>|clear|edit|pause|resume] (Codex usage)",
+			"pi-goal: /goal [<objective>|clear|edit|pause|resume] (Codex usage)",
 		handler: async (args, ctx) => {
 			const parts = (args || "").trim().split(/\s+/);
 			const sub = (parts[0] || "").toLowerCase();
@@ -426,13 +426,13 @@ export default function (pi: ExtensionAPI) {
 				};
 				saveGoal(g);
 				setDeferral(sid); // deferred: run one turn, then stop for the user
-				ctx.ui.notify(`pi-loop: goal set — ${g.objective} (active, ${budget ?? "no"} token budget)`, "info");
+				ctx.ui.notify(`pi-goal: goal set — ${g.objective} (active, ${budget ?? "no"} token budget)`, "info");
 				kickoffTurn(pi, sid); // codex continue_if_idle after setting a goal
 			};
 			if (sub === "set" || sub === "edit") {
 				const objective = (args || "").slice(parts[0].length).trim();
 				if (!objective) {
-					ctx.ui.notify("pi-loop: usage — /goal <objective> [token_budget]", "warning");
+					ctx.ui.notify("pi-goal: usage — /goal <objective> [token_budget]", "warning");
 					return;
 				}
 				const m = objective.match(/^(.*?)\s+(\d+)\s*$/);
@@ -448,8 +448,8 @@ export default function (pi: ExtensionAPI) {
 					g.updatedAt = Date.now();
 					saveGoal(g);
 					setDeferral(sid);
-					ctx.ui.notify("pi-loop: goal paused", "info");
-				} else ctx.ui.notify("pi-loop: no active goal to pause", "warning");
+					ctx.ui.notify("pi-goal: goal paused", "info");
+				} else ctx.ui.notify("pi-goal: no active goal to pause", "warning");
 				return;
 			}
 			if (sub === "resume") {
@@ -459,27 +459,27 @@ export default function (pi: ExtensionAPI) {
 					g.updatedAt = Date.now();
 					saveGoal(g);
 					setDeferral(sid); // one turn, then wait for the user
-					ctx.ui.notify(`pi-loop: goal resumed — ${g.objective}`, "info");
+					ctx.ui.notify(`pi-goal: goal resumed — ${g.objective}`, "info");
 					kickoffTurn(pi, sid);
-				} else ctx.ui.notify("pi-loop: no goal to resume", "warning");
+				} else ctx.ui.notify("pi-goal: no goal to resume", "warning");
 				return;
 			}
 			if (sub === "clear") {
 				deleteGoal(sid);
 				clearDeferral(sid);
-				ctx.ui.notify("pi-loop: goal cleared", "info");
+				ctx.ui.notify("pi-goal: goal cleared", "info");
 				return;
 			}
 			// No argument: show the current goal summary (codex /goal, no args)
 			if (!sub) {
 				const g = loadGoal(sid);
 				if (!g) {
-					ctx.ui.notify("pi-loop: no goal. Usage: /goal <objective> [token_budget]", "info");
+					ctx.ui.notify("pi-goal: no goal. Usage: /goal <objective> [token_budget]", "info");
 					return;
 				}
 				ctx.ui.notify(
 					[
-						`pi-loop goal (${goalCore.statusLabel(g.status)})`,
+						`pi-goal goal (${goalCore.statusLabel(g.status)})`,
 						`objective: ${g.objective}`,
 						`progress: ${g.turns} turns, ${g.tokensUsed} tokens${g.tokenBudget !== null ? ` / ${g.tokenBudget} budget` : ""}${g.timeUsedSeconds > 0 ? `, ${goalCore.formatSeconds(g.timeUsedSeconds)} elapsed` : ""}`,
 						`created: ${new Date(g.createdAt).toISOString()}`,
