@@ -55,11 +55,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event) => ({
 		systemPrompt: enabled ? event.systemPrompt : core.filterLarkSkillsFromPrompt(event.systemPrompt),
-		message: {
-			customType: "pi-lark-context",
-			content: core.buildLarkPrompt(enabled),
-			display: false,
-		},
 	}));
 
 	pi.on("session_start", async (_event, ctx) => {

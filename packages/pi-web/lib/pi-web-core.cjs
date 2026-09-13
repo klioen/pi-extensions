@@ -7,6 +7,7 @@ const path = require("node:path");
 const SKILL_NAME_RE = /^(?!-)(?!.*--)[a-z0-9-]{1,64}(?<!-)$/;
 const MEMORY_DOCUMENTS = Object.freeze({ summary: "memory_summary.md", handbook: "MEMORY.md" });
 const EXTENSION_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
+const CHAT_MESSAGE_ROLES = new Set(["user", "assistant", "toolResult", "custom"]);
 
 function sha256Revision(value) {
 	return crypto.createHash("sha256").update(Buffer.isBuffer(value) ? value : Buffer.from(String(value), "utf8")).digest("hex");
@@ -423,6 +424,144 @@ function validateMemoryDocument(document, content) {
 	return { valid: errors.length === 0, errors, fileName: MEMORY_DOCUMENTS[document] };
 }
 
+function boundedChatString(value, maxChars, pattern) {
+	if (typeof value !== "string" || (pattern && !pattern.test(value))) return undefined;
+	return value.slice(0, maxChars);
+}
+
+function sanitizeChatText(value) {
+	return String(value);
+}
+
+function sanitizeChatValue(value, state, depth = 0) {
+	if (value === null || typeof value === "boolean") return value;
+	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+	if (typeof value === "string") {
+		if (value.length > 500) state.contentTruncated = true;
+		return value.slice(0, 500);
+	}
+	if (!value || typeof value !== "object" || depth >= 4) { state.contentTruncated = true; return undefined; }
+	if (Array.isArray(value)) {
+		if (value.length > 20) state.contentTruncated = true;
+		return value.slice(0, 20).map((item) => sanitizeChatValue(item, state, depth + 1)).filter((item) => item !== undefined);
+	}
+	const result = {};
+	const entries = Object.entries(value);
+	if (entries.length > 20) state.contentTruncated = true;
+	for (const [key, item] of entries.slice(0, 20)) {
+		if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(key) || key === "__proto__" || key === "prototype" || key === "constructor") continue;
+		const safe = sanitizeChatValue(item, state, depth + 1);
+		if (safe !== undefined) result[key] = safe;
+	}
+	return result;
+}
+
+function normalizeChatTextContent(content, maxTextChars, maxContentBlocks, state, options = {}) {
+	const values = typeof content === "string" ? [{ type: "text", text: content }] : Array.isArray(content) ? content : [];
+	const normalized = [];
+	for (const block of values) {
+		if (normalized.length >= maxContentBlocks) { state.contentTruncated = true; break; }
+		if (!block || typeof block !== "object") continue;
+		const isText = block.type === "text" && typeof block.text === "string";
+		const isThinking = options.allowThinking === true && block.type === "thinking" && typeof block.thinking === "string" && block.thinking.length > 0;
+		if (!isText && !isThinking) continue;
+		const safeText = sanitizeChatText(isThinking ? block.thinking : block.text);
+		const truncated = safeText.length > maxTextChars;
+		if (truncated) state.contentTruncated = true;
+		normalized.push({ type: isThinking ? "thinking" : "text", text: safeText.slice(0, maxTextChars), ...(truncated ? { truncated: true } : {}) });
+	}
+	return normalized;
+}
+
+function selectActiveSessionBranch(records) {
+	if (!Array.isArray(records) || records.length === 0) return Array.isArray(records) ? records : [];
+	const isTree = records.every((record) => record && typeof record === "object" && !Array.isArray(record)
+		&& typeof record.id === "string" && record.id.length > 0
+		&& Object.hasOwn(record, "parentId") && (record.parentId === null || typeof record.parentId === "string"));
+	if (!isTree) return records;
+
+	const byId = new Map(records.map((record) => [record.id, record]));
+	const path = [];
+	const visited = new Set();
+	let current = records[records.length - 1];
+	while (current && !visited.has(current.id)) {
+		path.push(current);
+		visited.add(current.id);
+		current = current.parentId ? byId.get(current.parentId) : undefined;
+	}
+	path.reverse();
+	return path;
+}
+
+function normalizeSessionChatHistory(records, options = {}) {
+	const maxEntries = Math.max(0, Math.floor(options.maxEntries ?? 2000));
+	const maxTextChars = Math.max(0, Math.floor(options.maxTextChars ?? 64 * 1024));
+	const maxContentBlocks = Math.max(1, Math.floor(options.maxContentBlocks ?? 100));
+	const state = { contentTruncated: false };
+	const displayable = [];
+	for (const record of Array.isArray(records) ? records : []) {
+		if (!record || typeof record !== "object" || Array.isArray(record)) continue;
+		let message;
+		if (record.type === "message" && record.message && typeof record.message === "object" && !Array.isArray(record.message)) message = record.message;
+		else if (record.type === "custom_message") message = { role: "custom", customType: record.customType, content: record.content, display: record.display };
+		else continue;
+
+		const role = message.role;
+		if (!CHAT_MESSAGE_ROLES.has(role) || (role === "custom" && message.display !== true)) continue;
+		const id = boundedChatString(record.id, 256, /^[A-Za-z0-9_.:-]+$/);
+		const timestamp = boundedChatString(record.timestamp, 64);
+		const entry = { ...(id ? { id } : {}), role, ...(timestamp ? { timestamp } : {}) };
+		const content = [];
+		if (role === "assistant" && Array.isArray(message.content)) {
+			for (const block of message.content) {
+				if (content.length >= maxContentBlocks) { state.contentTruncated = true; break; }
+				if (!block || typeof block !== "object") continue;
+				if (block.type === "text" || block.type === "thinking") {
+					content.push(...normalizeChatTextContent([block], maxTextChars, 1, state, { allowThinking: true }));
+					continue;
+				}
+				if (block.type !== "toolCall") continue;
+				const toolCallId = boundedChatString(block.id, 256, /^[A-Za-z0-9_.:-]+$/);
+				const name = boundedChatString(block.name, 128, /^[A-Za-z0-9_.:-]+$/);
+				if (toolCallId && name) {
+					const args = sanitizeChatValue(block.arguments, state);
+					content.push({ type: "toolCall", id: toolCallId, name, ...(args && typeof args === "object" ? { arguments: args } : {}) });
+				}
+			}
+		} else {
+			content.push(...normalizeChatTextContent(message.content, maxTextChars, maxContentBlocks, state));
+		}
+		if (role === "toolResult") {
+			const toolCallId = boundedChatString(message.toolCallId, 256, /^[A-Za-z0-9_.:-]+$/);
+			const toolName = boundedChatString(message.toolName, 128, /^[A-Za-z0-9_.:-]+$/);
+			if (toolCallId) entry.toolCallId = toolCallId;
+			if (toolName) entry.toolName = toolName;
+			entry.isError = message.isError === true;
+		}
+		if (role === "custom") {
+			const customType = boundedChatString(message.customType, 128, /^[A-Za-z0-9_.:-]+$/);
+			if (!customType) continue;
+			entry.customType = customType;
+		}
+		if (content.length === 0 && (role === "user" || role === "assistant" || role === "custom")) continue;
+		entry.content = content;
+		displayable.push(entry);
+	}
+	const entries = maxEntries === 0 ? [] : displayable.slice(-maxEntries);
+	const omittedEntries = displayable.length - entries.length;
+	return {
+		entries,
+		metadata: {
+			sourceEntries: Array.isArray(records) ? records.length : 0,
+			displayableEntries: displayable.length,
+			returnedEntries: entries.length,
+			omittedEntries,
+			truncated: omittedEntries > 0,
+			contentTruncated: state.contentTruncated,
+		},
+	};
+}
+
 function parseSessionJsonl(text, options = {}) {
 	const maxEntries = Math.max(0, options.maxEntries ?? 1000);
 	const lines = String(text).split(/\r?\n/);
@@ -437,7 +576,11 @@ function parseSessionJsonl(text, options = {}) {
 		catch (error) { diagnostics.push({ line: index + 1, message: error instanceof Error ? error.message : String(error) }); continue; }
 		if (!value || typeof value !== "object" || Array.isArray(value)) { diagnostics.push({ line: index + 1, message: "JSONL entry must be an object" }); continue; }
 		if (header === null && (value.type === "session" || value.type === "session_meta")) header = value;
-		else if (entries.length < maxEntries) entries.push(value);
+		else if (maxEntries > 0) {
+			entries.push(value);
+			if (options.keepLatest === true && entries.length > maxEntries) entries.shift();
+			else if (options.keepLatest !== true && entries.length > maxEntries) entries.pop();
+		}
 		counts[value.type ?? "unknown"] = (counts[value.type ?? "unknown"] ?? 0) + 1;
 		const timestamp = Date.parse(value.timestamp ?? value.payload?.timestamp ?? "");
 		if (Number.isFinite(timestamp)) { firstTimestamp = firstTimestamp === undefined ? timestamp : Math.min(firstTimestamp, timestamp); lastTimestamp = lastTimestamp === undefined ? timestamp : Math.max(lastTimestamp, timestamp); }
@@ -505,5 +648,5 @@ module.exports = {
 	normalizeSessionName, renameSessionWithRevision, removeSessionWithRevision, readTextBounded, readTailLinesBounded,
 	parseSkillFrontmatter, validateSkillDocument, serializeSkillDocument,
 	parseJsonFile, catalogSettings, catalogExtensions, catalogSkills, catalogEffectiveSkills,
-	validateMemoryDocument, parseSessionJsonl, summarizeSessions, buildSessionTree,
+	validateMemoryDocument, selectActiveSessionBranch, normalizeSessionChatHistory, parseSessionJsonl, summarizeSessions, buildSessionTree,
 };

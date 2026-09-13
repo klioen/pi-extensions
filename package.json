@@ -26,8 +26,16 @@
 		"@earendil-works/pi-ai": "*",
 		"typebox": "*"
 	},
+	"workspaces": [
+		"packages/*"
+	],
 	"scripts": {
-		"test": "node --test \"tests/*.test.mjs\"",
+		"test": "node --disable-warning=ExperimentalWarning --test \"tests/*.test.mjs\" && npm run pi-web:test && npm run pi-web:verify-public",
+		"pi-web:dev": "npm run dev --workspace pi-web",
+		"pi-web:build": "npm run build --workspace pi-web",
+		"pi-web:typecheck": "npm run typecheck --workspace pi-web",
+		"pi-web:test": "npm run test --workspace pi-web",
+		"pi-web:verify-public": "npm run verify:public --workspace pi-web",
 		"evals:list": "ls evals 2>/dev/null || echo '(no evals yet)'"
 	}
 }

@@ -27,15 +27,8 @@ function normalizeLarkState(value) {
 	return { enabled: Boolean(value && typeof value === "object" && value.enabled === true) };
 }
 
-function buildLarkPrompt(enabled) {
-	return enabled
-		? "CURRENT LARK MODE: ON. The lark-* skills listed in the system prompt are available for automatic routing."
-		: "CURRENT LARK MODE: OFF. The lark-* skills are not available for automatic routing. Ask the user to run /lark before relying on them.";
-}
-
 module.exports = {
 	LARK_SKILL_PREFIX,
-	buildLarkPrompt,
 	filterLarkSkills,
 	filterLarkSkillsFromPrompt,
 	isLarkSkill,

@@ -1,10 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { request as httpRequest } from "node:http";
 import { DatabaseSync } from "node:sqlite";
 import { createPiWebServer } from "../packages/pi-web/server/server.cjs";
+import { createChatEventHub } from "../packages/pi-web/lib/chat-core.cjs";
 import { SCHEMA } from "../packages/memory/lib/memory-core.cjs";
 
 async function withServer(run, serverOptions = {}) {
@@ -42,28 +45,83 @@ async function withServer(run, serverOptions = {}) {
 	memoryDb.close();
 	const sessionPath = join(root, "session.jsonl");
 	writeFileSync(sessionPath, `${JSON.stringify({ type: "session", id: "s1", cwd, timestamp: "2026-01-01T00:00:00Z" })}\n${JSON.stringify({ type: "message", id: "m1", timestamp: "2026-01-01T00:01:00Z" })}\n`);
-	const server = createPiWebServer({ host: "127.0.0.1", port: 0, cwd, agentDir, memoryDir, memoryDbPath, piRootDir, publicDir, projectTrusted: true, listSessions: async () => [{ id: "s1", path: sessionPath, cwd, name: "Demo", created: new Date(0), modified: new Date(1), messageCount: 1, firstMessage: "hello" }], ...serverOptions });
+	const resolvedServerOptions = typeof serverOptions === "function" ? serverOptions({ root, sessionPath, cwd }) : serverOptions;
+	const server = createPiWebServer({ host: "127.0.0.1", port: 0, cwd, agentDir, memoryDir, memoryDbPath, piRootDir, publicDir, projectTrusted: true, listSessions: async () => [{ id: "s1", path: sessionPath, cwd, name: "Demo", created: new Date(0), modified: new Date(1), messageCount: 1, firstMessage: "hello" }], ...resolvedServerOptions });
 	try { const address = await server.start(); await run({ root, base: `http://127.0.0.1:${address.port}`, headers: { origin: `http://127.0.0.1:${address.port}` } }); }
 	finally { await server.stop(); rmSync(root, { recursive: true, force: true }); }
 }
 
 async function json(response) { return response.json(); }
 
-test("Sessions UI renders the API directory tree instead of a flat table", () => {
-	const app = readFileSync(new URL("../packages/pi-web/public/app.js", import.meta.url), "utf8");
-	assert.match(app, /function sessionTreeNode\(node, depth = 0\)/);
-	assert.match(app, /const defaultOpen = children\.length > 0/);
-	assert.match(app, /<details class="session-tree-directory"[^>]*\$\{defaultOpen \? " open" : ""\}/);
-	assert.match(app, /const tree = list\(data, \["tree"\]\)/);
-	assert.match(app, /<section class="sessions-workbench"><aside class="session-browser">/);
-	assert.match(app, /<article class="session-detail" id="session-detail">/);
-	assert.match(app, /data-action="select-session"/);
-	assert.match(app, /data-action="rename-session"/);
-	assert.match(app, /data-action="delete-session"/);
-	assert.match(app, /async function loadSessionDetail\(id\)/);
-	const treeLeaf = app.slice(app.indexOf("function sessionTreeLeaf"), app.indexOf("function sessionTreeNode"));
-	assert.doesNotMatch(treeLeaf, /href="#\/sessions\//);
-	assert.doesNotMatch(app, /<th>Session<\/th><th>Status<\/th><th>Updated<\/th>/);
+function requestWithHost(base, pathname, { host, method = "GET", origin } = {}) {
+	const target = new URL(pathname, base);
+	return new Promise((resolve, reject) => {
+		const req = httpRequest(target, { method, headers: { ...(host ? { host } : {}), ...(origin ? { origin } : {}) } }, (res) => {
+			res.resume();
+			res.once("end", () => resolve(res.statusCode));
+		});
+		req.once("error", reject);
+		req.end();
+	});
+}
+
+const sseReaderState = new WeakMap();
+
+async function readSseFrame(reader, timeoutMs = 1000) {
+	let state = sseReaderState.get(reader);
+	if (!state) {
+		state = { decoder: new TextDecoder(), buffered: "" };
+		sseReaderState.set(reader, state);
+	}
+	for (;;) {
+		const end = state.buffered.indexOf("\n\n");
+		if (end >= 0) {
+			const frame = state.buffered.slice(0, end + 2);
+			state.buffered = state.buffered.slice(end + 2);
+			return frame;
+		}
+		const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timed out waiting for SSE frame")), timeoutMs));
+		const { value, done } = await Promise.race([reader.read(), timeout]);
+		if (done) return state.buffered;
+		state.buffered += state.decoder.decode(value, { stream: true });
+	}
+}
+
+function chatFixture(sessionPath, overrides = {}) {
+	const sessionId = overrides.sessionId || randomUUID();
+	const runId = overrides.runId || randomUUID();
+	const sent = [];
+	const aborted = [];
+	let snapshot = {
+		available: true,
+		currentSessionId: sessionId,
+		sessionName: "Current chat",
+		cwd: "/not-returned-as-a-path",
+		idle: true,
+		hasPendingMessages: false,
+		activeRun: null,
+		eventCursor: 0,
+		capabilities: { send: true, followUp: true, abort: true, steer: false, createSession: false, switchSession: false },
+	};
+	const adapter = {
+		getSnapshot: () => snapshot,
+		getCurrentSessionRecord: async () => ({ id: sessionId, path: sessionPath }),
+		sendUserMessage: async (input) => {
+			sent.push(input);
+			return { accepted: true, requestId: input.requestId, delivery: snapshot.idle ? "immediate" : "followUp" };
+		},
+		abort: async (input) => { aborted.push(input); },
+	};
+	return { sessionId, runId, sent, aborted, adapter, get snapshot() { return snapshot; }, set snapshot(value) { snapshot = value; } };
+}
+
+test("pi-web production bundle is a local Vite React application", () => {
+	const html = readFileSync(new URL("../packages/pi-web/public/index.html", import.meta.url), "utf8");
+	assert.match(html, /<div id="root"><\/div>/);
+	assert.match(html, /\.\/assets\/index-[A-Za-z0-9_-]+\.js/);
+	assert.match(html, /\.\/assets\/index-[A-Za-z0-9_-]+\.css/);
+	assert.doesNotMatch(html, /https?:\/\//);
+	assert.doesNotMatch(html, /app\.js|chat-runtime\.js|chat-view\.js/);
 });
 
 test("pi-web extension routes current and historical session renames through Pi APIs", () => {
@@ -74,26 +132,44 @@ test("pi-web extension routes current and historical session renames through Pi 
 	assert.match(extension, /SessionManager\.open\(session\.path\)\.appendSessionInfo\(name\)/);
 });
 
-test("Memory UI keeps health, pipeline, workers, and artifact entry points on overview only", () => {
-	const app = readFileSync(new URL("../packages/pi-web/public/app.js", import.meta.url), "utf8");
-	assert.doesNotMatch(app, /\["pipeline",\s*"Pipeline"\]|\["artifacts",\s*"Artifacts"\]/);
-	assert.doesNotMatch(app, /memoryPage === "pipeline"|function renderMemoryPipeline|function renderArtifacts/);
-	assert.match(app, /renderMemoryOverview[\s\S]*Promise\.all\(\[[\s\S]*observatory\/overview[\s\S]*observatory\/workers[\s\S]*observatory\/artifacts/);
-	assert.match(app, /capabilityNotice\(overview, \{ always: true \}\)/);
-	assert.match(app, /const timeLabel = updatedAt \? fmtDate\(updatedAt\)/);
-	assert.match(app, /#\/memory\/artifact\/\$\{encodeURIComponent\(id\)\}/);
-	assert.match(app, /const contentData = directory \? null : await api\(`\/api\/memory\/observatory\/artifacts\/\$\{encodeURIComponent\(id\)\}\/content`\)/);
-	assert.doesNotMatch(app, /Load file content|load-artifact-content|function loadArtifactContent/);
+test("pi-web React source owns route and memory UI behavior", () => {
+	const router = readFileSync(new URL("../packages/pi-web/src/app/router.tsx", import.meta.url), "utf8");
+	const memory = readFileSync(new URL("../packages/pi-web/src/pages/MemoryPage.tsx", import.meta.url), "utf8");
+	assert.match(router, /createHashRouter/);
+	assert.match(router, /path: "memory\/\*"/);
+	assert.match(memory, /\/api\/memory\/observatory\/overview/);
+	assert.match(memory, /\/api\/memory\/observatory\/workers/);
+	assert.match(memory, /\/api\/memory\/observatory\/artifacts/);
 });
 
-test("pi-web serves tokenless loopback APIs and the static Control Deck", () => withServer(async ({ base, headers }) => {
+test("pi-web accepts equivalent loopback Host and Origin values on the bound port", () => withServer(async ({ base }) => {
+	const port = new URL(base).port;
+	for (const authority of [`localhost:${port}`, `[::1]:${port}`]) {
+		assert.equal(await requestWithHost(base, "/api/overview", { host: authority }), 200, authority);
+		assert.equal(await requestWithHost(base, "/api/not-found", { method: "POST", host: authority, origin: `http://${authority}` }), 404, authority);
+	}
+	assert.equal(await requestWithHost(base, "/api/overview", { host: `evil.test:${port}` }), 403);
+	assert.equal(await requestWithHost(base, "/api/not-found", { method: "POST", host: `localhost:${port}`, origin: `http://evil.test:${port}` }), 403);
+	assert.equal(await requestWithHost(base, "/api/not-found", { method: "POST", host: `localhost:${Number(port) + 1}`, origin: `http://localhost:${Number(port) + 1}` }), 403);
+}));
+
+test("pi-web serves tokenless loopback APIs and caches only hashed Vite assets immutably", () => withServer(async ({ root, base, headers }) => {
+	const assets = join(root, "public", "assets");
+	mkdirSync(assets);
+	writeFileSync(join(assets, "index-Ab12_cd3.js"), "export default true;");
+	writeFileSync(join(assets, "runtime.js"), "export default false;");
 	const overview = await fetch(`${base}/api/overview`);
 	assert.equal(overview.status, 200);
 	assert.deepEqual((await json(overview)).counts, { sessions: 1, skills: 2, extensions: 1, packages: 2 });
 	const page = await fetch(base);
 	assert.equal(page.status, 200);
 	assert.match(await page.text(), /Pi Web/);
+	assert.equal(page.headers.get("cache-control"), "no-cache");
 	assert.match(page.headers.get("content-security-policy"), /default-src 'self'/);
+	const hashedAsset = await fetch(`${base}/assets/index-Ab12_cd3.js`);
+	assert.equal(hashedAsset.status, 200);
+	assert.equal(hashedAsset.headers.get("cache-control"), "public, max-age=31536000, immutable");
+	assert.equal((await fetch(`${base}/assets/runtime.js`)).headers.get("cache-control"), "no-cache");
 	assert.equal((await fetch(`${base}/../package.json`)).status, 404);
 }));
 
@@ -123,20 +199,51 @@ test("pi-web exposes bounded session detail and static resource catalogs", () =>
 	assert.equal(sessions.sessions[0].id, "s1");
 	assert.equal(sessions.tree[0].name, "/");
 	assert.equal(sessions.tree[0].sessionCount, 1);
+	assert.match(sessions.sessions[0].projectId, /^[a-f0-9]{64}$/);
+	assert.doesNotMatch(sessions.sessions[0].projectId, /project|Users/);
 	assert.doesNotMatch(JSON.stringify(sessions), /"(?:path|file)":|session\.jsonl/);
 	const treeSessions = (nodes) => nodes.flatMap((node) => [...node.sessions, ...treeSessions(node.children)]);
 	assert.deepEqual(treeSessions(sessions.tree).map((item) => item.id), ["s1"]);
 	const detail = await json(await fetch(`${base}/api/sessions/s1`, { headers }));
 	assert.equal(detail.summary.sessionId, "s1");
-	assert.equal(detail.entries.length, 1);
 	assert.match(detail.revision, /^[a-f0-9]{64}$/);
-	assert.doesNotMatch(JSON.stringify(detail.session), /"(?:path|file)":|session\.jsonl/);
+	assert.ok(Array.isArray(detail.chatHistory));
+	assert.doesNotMatch(JSON.stringify(detail), /credential|"details":|"(?:path|file)":|session\.jsonl|thinkingSignature/);
 	const extensions = await json(await fetch(`${base}/api/extensions`, { headers }));
 	assert.equal(extensions.entries.length, 1);
 	assert.equal(extensions.settings.packages[0].source, "npm:demo");
 	assert.doesNotMatch(JSON.stringify(extensions), /SECRET_SENTINEL|NESTED_SECRET/);
 	assert.deepEqual(extensions.settings.packages[1].skills, ["skills/**"]);
 }));
+
+test("pi-web historical session detail retains the latest 2000 records", () => withServer(async ({ root, base, headers }) => {
+	const sessionPath = join(root, "historical-long.jsonl");
+	const records = [{ type: "session", id: "long-session", cwd: root }];
+	for (let index = 0; index < 2105; index++) records.push({ type: "message", id: `m${index}`, message: { role: "user", content: `message-${index}` } });
+	writeFileSync(sessionPath, `${records.map(JSON.stringify).join("\n")}\n`);
+	const detail = await json(await fetch(`${base}/api/sessions/long-session`, { headers }));
+	assert.equal(detail.chatHistory.length, 2000);
+	assert.equal(detail.chatHistory[0].id, "m105");
+	assert.equal(detail.chatHistory.at(-1).id, "m2104");
+	assert.equal(detail.summary.truncated, true);
+}, ({ root }) => ({
+	listSessions: async () => [{ id: "long-session", path: join(root, "historical-long.jsonl"), cwd: root, name: "Long" }],
+})));
+
+test("pi-web historical session detail reads the latest records from files over 16 MiB", () => withServer(async ({ root, base, headers }) => {
+	const sessionPath = join(root, "historical-oversized.jsonl");
+	const header = { type: "session", id: "oversized-session", cwd: root };
+	const padding = { type: "custom", id: "padding", parentId: null, data: "x".repeat(16 * 1024 * 1024) };
+	const latest = { type: "message", id: "latest", parentId: "padding", message: { role: "assistant", content: "latest tail message" } };
+	writeFileSync(sessionPath, `${JSON.stringify(header)}\n${JSON.stringify(padding)}\n${JSON.stringify(latest)}\n`);
+	const detail = await json(await fetch(`${base}/api/sessions/oversized-session`, { headers }));
+	assert.equal(detail.sourceTruncated, true);
+	assert.equal(detail.revision, undefined);
+	assert.deepEqual(detail.chatHistory.map((entry) => entry.id), ["latest"]);
+	assert.equal(detail.chatHistory[0].content[0].text, "latest tail message");
+}, ({ root }) => ({
+	listSessions: async () => [{ id: "oversized-session", path: join(root, "historical-oversized.jsonl"), cwd: root, name: "Oversized" }],
+})));
 
 test("pi-web renames sessions with revision checks and protects current session deletion", () => {
 	let sessionPath;
@@ -236,6 +343,251 @@ test("pi-web exposes fixed Memory Overview artifacts and directory metadata with
 	assert.equal((await fetch(`${base}/api/memory/observatory/artifacts/unknown`, { headers })).status, 404);
 	assert.equal((await fetch(`${base}/api/memory/observatory/artifacts/unknown/content`, { headers })).status, 404);
 }));
+
+test("pi-web chat snapshot and bounded current history use only the injected current record", () => {
+	let chat;
+	return withServer(async ({ root, base, headers }) => {
+	const sessionPath = join(root, "chat-current.jsonl");
+	writeFileSync(sessionPath, [
+		{ type: "session", id: chat.sessionId, cwd: root },
+		{ type: "message", id: "u1", message: { role: "user", content: "hello", thinking: "USER_METADATA_MUST_STAY_HIDDEN" } },
+		{ type: "message", id: "a1", message: { role: "assistant", content: [{ type: "thinking", thinking: "Inspect /Users/alice/private token=sk-abcdefghijklmnop", thinkingSignature: "SIGNED_SECRET", details: { token: "NOPE" } }, { type: "text", text: "hi" }] } },
+	].map(JSON.stringify).join("\n"));
+	const snapshotResponse = await fetch(`${base}/api/chat/snapshot`, { headers });
+	assert.equal(snapshotResponse.status, 200);
+	const snapshot = await json(snapshotResponse);
+	assert.equal(snapshot.currentSessionId, chat.sessionId);
+	assert.equal(snapshot.eventCursor, 0);
+	assert.doesNotMatch(JSON.stringify(snapshot), /chat-current\.jsonl/);
+	const historyResponse = await fetch(`${base}/api/chat/history`, { headers });
+	assert.equal(historyResponse.status, 200);
+	const history = await json(historyResponse);
+	assert.equal(history.sessionId, chat.sessionId);
+	assert.deepEqual(history.entries.map((entry) => entry.role), ["user", "assistant"]);
+	assert.deepEqual(history.entries[1].content, [
+		{ type: "thinking", text: "Inspect /Users/alice/private token=sk-abcdefghijklmnop" },
+		{ type: "text", text: "hi" },
+	]);
+	assert.match(history.revision, /^[a-f0-9]{64}$/);
+	assert.equal(history.truncated, false);
+	assert.doesNotMatch(JSON.stringify(history), /USER_METADATA_MUST_STAY_HIDDEN|SIGNED_SECRET|NOPE|thinkingSignature|details|chat-current\.jsonl/);
+	assert.match(JSON.stringify(history), /\/Users\/alice.*abcdefghijklmnop/);
+	}, ({ root }) => {
+		const sessionPath = join(root, "chat-current.jsonl");
+		chat = chatFixture(sessionPath);
+		return { chatAdapter: chat.adapter };
+	});
+});
+
+test("pi-web chat history returns a safe error when the current session file cannot be read", () => {
+	let chat;
+	return withServer(async ({ root, base, headers }) => {
+		const response = await fetch(`${base}/api/chat/history`, { headers });
+		assert.equal(response.status, 503);
+		const body = await json(response);
+		assert.deepEqual(body, { error: "Chat history is unavailable", code: "CHAT_HISTORY_UNAVAILABLE" });
+		assert.doesNotMatch(JSON.stringify(body), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+	}, ({ root }) => {
+		chat = chatFixture(join(root, "missing-private-session.jsonl"));
+		return { chatAdapter: chat.adapter };
+	});
+});
+
+test("pi-web chat history retains the latest 2000 records from long sessions", () => {
+	let chat;
+	return withServer(async ({ root, base, headers }) => {
+		const sessionPath = join(root, "chat-long.jsonl");
+		const records = [{ type: "session", id: chat.sessionId, cwd: root }];
+		for (let index = 0; index < 2105; index++) records.push({ type: "message", id: `m${index}`, message: { role: "user", content: `message-${index}` } });
+		writeFileSync(sessionPath, `${records.map(JSON.stringify).join("\n")}\n`);
+		const response = await fetch(`${base}/api/chat/history`, { headers });
+		assert.equal(response.status, 200);
+		const history = await json(response);
+		assert.equal(history.entries.length, 2000);
+		assert.equal(history.entries[0].id, "m105");
+		assert.equal(history.entries.at(-1).id, "m2104");
+		assert.equal(history.truncated, true);
+	}, ({ root }) => {
+		chat = chatFixture(join(root, "chat-long.jsonl"));
+		return { chatAdapter: chat.adapter };
+	});
+});
+
+test("pi-web chat message validates input, current session, delivery, and request idempotency", () => {
+	let chat;
+	return withServer(async ({ root, base, headers }) => {
+		const sessionPath = join(root, "chat.jsonl");
+		writeFileSync(sessionPath, `${JSON.stringify({ type: "session", id: chat.sessionId })}\n`);
+		const requestId = randomUUID();
+		const send = (body) => fetch(`${base}/api/chat/messages`, { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(body) });
+		const accepted = await send({ requestId, sessionId: chat.sessionId, text: " hello " });
+		assert.equal(accepted.status, 202);
+		assert.equal((await json(accepted)).delivery, "immediate");
+		assert.deepEqual(chat.sent, [{ requestId, text: " hello " }]);
+		assert.equal((await send({ requestId, sessionId: chat.sessionId, text: "changed duplicate" })).status, 202);
+		assert.equal(chat.sent.length, 1);
+		assert.equal((await send({ requestId: randomUUID(), sessionId: randomUUID(), text: "stale" })).status, 409);
+		assert.equal((await send({ requestId: "bad", sessionId: chat.sessionId, text: "hello" })).status, 400);
+		assert.equal((await send({ requestId: randomUUID(), sessionId: chat.sessionId, text: "   " })).status, 400);
+		assert.equal((await send({ requestId: randomUUID(), sessionId: chat.sessionId, text: "x".repeat(64 * 1024 + 1) })).status, 413);
+		const unavailable = { ...chat.snapshot, available: false };
+		chat.snapshot = unavailable;
+		assert.equal((await send({ requestId: randomUUID(), sessionId: chat.sessionId, text: "hello" })).status, 503);
+	}, ({ sessionPath }) => {
+		chat = chatFixture(sessionPath);
+		return { chatAdapter: chat.adapter };
+	});
+});
+
+test("pi-web chat abort requires the current session and active run", () => {
+	let chat;
+	return withServer(async ({ root, base, headers }) => {
+		const sessionPath = join(root, "chat.jsonl");
+		chat.snapshot = { ...chat.snapshot, idle: false, activeRun: { runId: chat.runId, state: "running" } };
+		const abort = (body) => fetch(`${base}/api/chat/abort`, { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(body) });
+		assert.equal((await abort({ sessionId: chat.sessionId, runId: randomUUID() })).status, 409);
+		const accepted = await abort({ sessionId: chat.sessionId, runId: chat.runId });
+		assert.equal(accepted.status, 202);
+		assert.deepEqual(chat.aborted, [{ sessionId: chat.sessionId, runId: chat.runId }]);
+	}, ({ sessionPath }) => {
+		chat = chatFixture(sessionPath);
+		return { chatAdapter: chat.adapter };
+	});
+});
+
+test("pi-web chat SSE filters replay and live events to the snapshot session", () => {
+	let chat;
+	const eventHub = createChatEventHub({ maxEvents: 10 });
+	return withServer(async ({ base, headers }) => {
+		const otherSessionId = randomUUID();
+		eventHub.publish({ type: "message.delta", sessionId: otherSessionId, data: { messageId: "foreign-replay", role: "assistant", delta: "secret" } });
+		eventHub.publish({ type: "message.delta", sessionId: chat.sessionId, data: { messageId: "current-replay", role: "assistant", delta: "safe" } });
+		const response = await fetch(`${base}/api/chat/events`, { headers: { ...headers, "last-event-id": "0" } });
+		assert.equal(response.status, 200);
+		const reader = response.body.getReader();
+		const replay = await readSseFrame(reader);
+		assert.match(replay, /id: 2\nevent: message\.delta/);
+		assert.match(replay, /current-replay/);
+		assert.doesNotMatch(replay, /foreign-replay|secret|stream\.reset/);
+		eventHub.publish({ type: "message.delta", sessionId: otherSessionId, data: { messageId: "foreign-live", role: "assistant", delta: "secret-live" } });
+		eventHub.publish({ type: "message.delta", sessionId: chat.sessionId, data: { messageId: "current-live", role: "assistant", delta: "safe-live" } });
+		const live = await readSseFrame(reader);
+		assert.match(live, /id: 4\nevent: message\.delta/);
+		assert.match(live, /current-live/);
+		assert.doesNotMatch(live, /foreign-live|secret-live|stream\.reset/);
+		eventHub.publish({ type: "session.changed", sessionId: otherSessionId, data: { previousSessionId: chat.sessionId, currentSessionId: otherSessionId, available: true, reason: "new" } });
+		const changed = await readSseFrame(reader);
+		assert.match(changed, /event: session\.changed/);
+		assert.match(changed, new RegExp(otherSessionId));
+		await reader.cancel();
+	}, ({ sessionPath }) => {
+		chat = chatFixture(sessionPath);
+		return { chatAdapter: chat.adapter, eventHub };
+	});
+});
+
+test("pi-web chat SSE stays ordered when subscribe publishes an event also visible to replay", () => {
+	let chat;
+	const baseHub = createChatEventHub({ maxEvents: 10 });
+	let publishOnSubscribe;
+	const eventHub = {
+		get cursor() { return baseHub.cursor; },
+		replay: (cursor) => baseHub.replay(cursor),
+		publish: (event) => baseHub.publish(event),
+		subscribe(listener) {
+			const unsubscribe = baseHub.subscribe(listener);
+			publishOnSubscribe?.();
+			return unsubscribe;
+		},
+	};
+	return withServer(async ({ base, headers }) => {
+		eventHub.publish({ type: "message.delta", sessionId: chat.sessionId, data: { messageId: "m1", role: "assistant", delta: "one" } });
+		publishOnSubscribe = () => eventHub.publish({ type: "message.delta", sessionId: chat.sessionId, data: { messageId: "m1", role: "assistant", delta: "two" } });
+		const response = await fetch(`${base}/api/chat/events`, { headers: { ...headers, "last-event-id": "0" } });
+		const reader = response.body.getReader();
+		const first = await readSseFrame(reader);
+		const second = await readSseFrame(reader);
+		eventHub.publish({ type: "message.delta", sessionId: chat.sessionId, data: { messageId: "m1", role: "assistant", delta: "three" } });
+		const third = await readSseFrame(reader);
+		assert.deepEqual([first, second, third].map((frame) => Number(frame.match(/^id: (\d+)/m)?.[1])), [1, 2, 3]);
+		assert.deepEqual([first, second, third].map((frame) => JSON.parse(frame.match(/^data: (.+)$/m)?.[1]).data.delta), ["one", "two", "three"]);
+		await reader.cancel();
+	}, ({ sessionPath }) => {
+		chat = chatFixture(sessionPath);
+		return { chatAdapter: chat.adapter, eventHub };
+	});
+});
+
+test("pi-web chat SSE conservatively resets when an evicted replay gap cannot be attributed", () => {
+	let chat;
+	const eventHub = createChatEventHub({ maxEvents: 2 });
+	return withServer(async ({ base, headers }) => {
+		const otherSessionId = randomUUID();
+		for (let index = 0; index < 3; index++) eventHub.publish({ type: "message.delta", sessionId: otherSessionId, data: { messageId: `foreign-${index}`, role: "assistant", delta: "secret" } });
+		const response = await fetch(`${base}/api/chat/events`, { headers: { ...headers, "last-event-id": "0" } });
+		const reader = response.body.getReader();
+		const frame = await readSseFrame(reader);
+		assert.match(frame, /event: stream\.reset/);
+		assert.match(frame, /SSE_REPLAY_EXPIRED/);
+		assert.doesNotMatch(frame, /foreign-|secret/);
+		await reader.cancel();
+	}, ({ sessionPath }) => {
+		chat = chatFixture(sessionPath);
+		return { chatAdapter: chat.adapter, eventHub, sseHeartbeatMs: 10 };
+	});
+});
+
+test("pi-web chat SSE replays, resets expired cursors for the current session, heartbeats, and unsubscribes", () => {
+	let chat;
+	const baseHub = createChatEventHub({ maxEvents: 2 });
+	let subscribers = 0;
+	const eventHub = {
+		get cursor() { return baseHub.cursor; },
+		replay: (cursor) => baseHub.replay(cursor),
+		publish: (event) => baseHub.publish(event),
+		subscribe(listener) { subscribers++; const unsubscribe = baseHub.subscribe(listener); return () => { subscribers--; unsubscribe(); }; },
+	};
+	return withServer(async ({ root, base, headers }) => {
+		for (let index = 0; index < 3; index++) eventHub.publish({ type: "message.delta", sessionId: chat.sessionId, data: { messageId: "m1", role: "assistant", delta: String(index) } });
+		const replayResponse = await fetch(`${base}/api/chat/events`, { headers: { ...headers, "last-event-id": "2" } });
+		assert.equal(replayResponse.status, 200);
+		assert.match(replayResponse.headers.get("content-type"), /text\/event-stream/);
+		const replayReader = replayResponse.body.getReader();
+		assert.match(await readSseFrame(replayReader), /id: 3\nevent: message\.delta\ndata:/);
+		await replayReader.cancel();
+		const resetResponse = await fetch(`${base}/api/chat/events`, { headers: { ...headers, "last-event-id": "0" } });
+		const resetReader = resetResponse.body.getReader();
+		const reset = await readSseFrame(resetReader);
+		assert.match(reset, /event: stream\.reset/);
+		assert.match(reset, /SSE_REPLAY_EXPIRED/);
+		await resetReader.cancel();
+		const liveResponse = await fetch(`${base}/api/chat/events`, { headers: { ...headers, "last-event-id": "3" } });
+		const liveReader = liveResponse.body.getReader();
+		assert.equal(subscribers, 1);
+		assert.match(await readSseFrame(liveReader), /^: heartbeat/m);
+		await liveReader.cancel();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.equal(subscribers, 0);
+	}, ({ sessionPath }) => {
+		chat = chatFixture(sessionPath);
+		return { chatAdapter: chat.adapter, eventHub, sseHeartbeatMs: 10 };
+	});
+});
+
+test("pi-web chat SSE enforces a client limit with a stable error code", () => {
+	let chat;
+	return withServer(async ({ base, headers }) => {
+		const first = await fetch(`${base}/api/chat/events`, { headers });
+		assert.equal(first.status, 200);
+		const rejected = await fetch(`${base}/api/chat/events`, { headers });
+		assert.equal(rejected.status, 503);
+		assert.deepEqual(await json(rejected), { error: "Too many chat event clients", code: "SSE_CLIENT_LIMIT" });
+		await first.body.cancel();
+	}, ({ sessionPath }) => {
+		chat = chatFixture(sessionPath);
+		return { chatAdapter: chat.adapter, maxSseClients: 1 };
+	});
+});
 
 test("pi-web legacy memory documents remain GET-only and reject PUT", () => withServer(async ({ root, base, headers }) => {
 	const summary = await json(await fetch(`${base}/api/memory/summary`, { headers }));

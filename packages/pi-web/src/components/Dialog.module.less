@@ -1,0 +1,14 @@
+.dialog {
+  width: min(440px, calc(100vw - 32px));
+  padding: 24px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--shadow-float);
+
+  &::backdrop { background: rgb(15 18 26 / 45%); backdrop-filter: blur(2px); }
+  h2 { margin: 0; font-size: 18px; }
+}
+.content { margin-top: 12px; color: var(--text-secondary); }
+.actions { margin-top: 24px; display: flex; justify-content: flex-end; gap: 8px; }

@@ -25,7 +25,25 @@ export function catalogExtensions(roots: Array<string | { path: string; scope: s
 export function catalogSkills(roots: Array<string | { path: string; scope: string; mutable?: boolean }>): { skills: any[]; diagnostics: Diagnostic[] };
 export function catalogEffectiveSkills(commands: any[], writableRoots?: Array<{ path: string; scope: string; mutable?: boolean }>): { skills: any[]; diagnostics: Diagnostic[] };
 export function validateMemoryDocument(document: string, content: string): { valid: boolean; errors: string[]; fileName?: string };
-export function parseSessionJsonl(text: string, options?: { maxEntries?: number }): { header: any; entries: any[]; diagnostics: Diagnostic[]; summary: { sessionId?: string; cwd?: string; totalEntries: number; returnedEntries: number; truncated: boolean; counts: Record<string, number>; firstTimestamp?: number; lastTimestamp?: number } };
+export interface SessionChatTextContent { type: "text"; text: string; truncated?: true }
+export interface SessionChatToolCallContent { type: "toolCall"; id: string; name: string }
+export interface SessionChatHistoryEntry {
+	id?: string;
+	role: "user" | "assistant" | "toolResult" | "custom";
+	timestamp?: string;
+	content: Array<SessionChatTextContent | SessionChatToolCallContent>;
+	toolCallId?: string;
+	toolName?: string;
+	isError?: boolean;
+	customType?: string;
+}
+export interface SessionChatHistory {
+	entries: SessionChatHistoryEntry[];
+	metadata: { sourceEntries: number; displayableEntries: number; returnedEntries: number; omittedEntries: number; truncated: boolean; contentTruncated: boolean };
+}
+export function selectActiveSessionBranch<T>(records: T[]): T[];
+export function normalizeSessionChatHistory(records: unknown[], options?: { maxEntries?: number; maxTextChars?: number; maxContentBlocks?: number }): SessionChatHistory;
+export function parseSessionJsonl(text: string, options?: { maxEntries?: number; keepLatest?: boolean }): { header: any; entries: any[]; diagnostics: Diagnostic[]; summary: { sessionId?: string; cwd?: string; totalEntries: number; returnedEntries: number; truncated: boolean; counts: Record<string, number>; firstTimestamp?: number; lastTimestamp?: number } };
 export function summarizeSessions(sessions: any[], query?: string): any[];
 export interface SessionTreeNode { id: string; name: string; children: SessionTreeNode[]; sessions: any[]; sessionCount: number; modified?: string | number }
 export function buildSessionTree(sessions: any[]): SessionTreeNode[];

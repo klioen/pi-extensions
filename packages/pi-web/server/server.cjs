@@ -7,6 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { URL } = require("node:url");
 const core = require("../lib/pi-web-core.cjs");
+const chatCore = require("../lib/chat-core.cjs");
 const diskUsageCore = require("../lib/disk-usage-core.cjs");
 const observatoryCore = require("../lib/memory-observatory-core.cjs");
 
@@ -14,6 +15,11 @@ const JSON_LIMIT = 1024 * 1024;
 const DOCUMENT_LIMIT = 5 * 1024 * 1024;
 const SESSION_LIMIT = 16 * 1024 * 1024;
 const LOG_LIMIT = 200;
+const SSE_HEARTBEAT_MS = 15_000;
+const SSE_CLIENT_LIMIT = 32;
+const CHAT_HISTORY_ENTRIES = 2000;
+const SESSION_HEADER_LIMIT = 64 * 1024;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function json(res, status, body, headers = {}) {
 	const data = Buffer.from(JSON.stringify(body));
@@ -23,8 +29,11 @@ function json(res, status, body, headers = {}) {
 
 function errorStatus(error) {
 	if (error instanceof URIError) return 400;
-	if (["INVALID_REVISION", "INVALID_SKILL", "INVALID_MEMORY", "INVALID_JSON", "INVALID_SESSION_NAME", "BODY_TOO_LARGE", "INVALID_FIELD", "INVALID_DISK_USAGE_QUERY"].includes(error?.code)) return 400;
-	if (["REVISION_CONFLICT", "RESOURCE_LOCKED", "RESOURCE_EXISTS", "CURRENT_SESSION"].includes(error?.code)) return 409;
+	if (error?.code === "MESSAGE_TOO_LARGE") return 413;
+	if (error?.code === "CHAT_QUEUE_FULL") return 429;
+	if (["CHAT_UNAVAILABLE", "CHAT_HISTORY_UNAVAILABLE", "SSE_CLIENT_LIMIT"].includes(error?.code)) return 503;
+	if (["INVALID_REVISION", "INVALID_SKILL", "INVALID_MEMORY", "INVALID_JSON", "INVALID_SESSION_NAME", "BODY_TOO_LARGE", "INVALID_FIELD", "INVALID_DISK_USAGE_QUERY", "INVALID_CHAT_MESSAGE", "INVALID_EVENT_CURSOR"].includes(error?.code)) return 400;
+	if (["REVISION_CONFLICT", "RESOURCE_LOCKED", "RESOURCE_EXISTS", "CURRENT_SESSION", "SESSION_CHANGED", "RUN_CHANGED"].includes(error?.code)) return 409;
 	if (["READ_ONLY", "PATH_FORBIDDEN", "RESOURCE_TOO_LARGE"].includes(error?.code)) return 403;
 	if (["ENOENT", "ARTIFACT_NOT_FOUND"].includes(error?.code)) return 404;
 	return 500;
@@ -48,6 +57,23 @@ function safeReadBounded(file, fallback = "") {
 
 function urlHost(host) {
 	return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+}
+
+function loopbackAuthorities(port) {
+	return new Set([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]);
+}
+
+function isAllowedLoopbackHost(value, port) {
+	return typeof value === "string" && loopbackAuthorities(port).has(value.toLowerCase());
+}
+
+function isAllowedLoopbackOrigin(value, port) {
+	if (typeof value !== "string") return false;
+	const allowed = loopbackAuthorities(port);
+	try {
+		const parsed = new URL(value);
+		return parsed.protocol === "http:" && !parsed.username && !parsed.password && parsed.pathname === "/" && !parsed.search && !parsed.hash && allowed.has(parsed.host.toLowerCase());
+	} catch { return false; }
 }
 
 function tailLines(file, count = 50) {
@@ -110,6 +136,78 @@ function findSkill(catalog, id, requireMutable = false) {
 	return item;
 }
 
+function chatError(code, message) {
+	return Object.assign(new Error(message), { code });
+}
+
+function publicChatSnapshot(snapshot, eventCursor) {
+	const source = snapshot && typeof snapshot === "object" ? snapshot : {};
+	const run = source.activeRun && typeof source.activeRun === "object" ? source.activeRun : undefined;
+	const capabilities = source.capabilities && typeof source.capabilities === "object" ? source.capabilities : {};
+	return {
+		available: source.available === true,
+		currentSessionId: typeof source.currentSessionId === "string" ? source.currentSessionId : undefined,
+		sessionName: typeof source.sessionName === "string" ? source.sessionName : undefined,
+		cwd: typeof source.cwd === "string" ? source.cwd : undefined,
+		idle: source.idle === true,
+		hasPendingMessages: source.hasPendingMessages === true,
+		activeRun: run && UUID_RE.test(run.runId) ? {
+			runId: run.runId,
+			...(typeof run.state === "string" ? { state: run.state } : {}),
+			...(typeof run.requestId === "string" && UUID_RE.test(run.requestId) ? { requestId: run.requestId } : {}),
+		} : null,
+		eventCursor,
+		capabilities: Object.fromEntries(["send", "followUp", "abort", "steer", "createSession", "switchSession"].map((key) => [key, capabilities[key] === true])),
+	};
+}
+
+function sseFrame(event) {
+	return `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+}
+
+function readSessionDocumentTail(file) {
+	const size = fs.statSync(file).size;
+	if (size <= SESSION_LIMIT) return { text: fs.readFileSync(file, "utf8"), truncated: false };
+	const descriptor = fs.openSync(file, "r");
+	try {
+		const headerBuffer = Buffer.allocUnsafe(Math.min(size, SESSION_HEADER_LIMIT));
+		const headerBytes = fs.readSync(descriptor, headerBuffer, 0, headerBuffer.length, 0);
+		const headerText = headerBuffer.subarray(0, headerBytes).toString("utf8");
+		const headerEnd = headerText.indexOf("\n");
+		const header = headerEnd < 0 ? headerText : headerText.slice(0, headerEnd);
+		const tailBuffer = Buffer.allocUnsafe(SESSION_LIMIT);
+		const tailBytes = fs.readSync(descriptor, tailBuffer, 0, SESSION_LIMIT, size - SESSION_LIMIT);
+		let tail = tailBuffer.subarray(0, tailBytes).toString("utf8");
+		const firstLineEnd = tail.indexOf("\n");
+		tail = firstLineEnd < 0 ? "" : tail.slice(firstLineEnd + 1);
+		return { text: `${header}\n${tail}`, truncated: true };
+	} finally {
+		fs.closeSync(descriptor);
+	}
+}
+
+function parseRecentSessionRecords(text, maxEntries = CHAT_HISTORY_ENTRIES) {
+	let header;
+	const records = [];
+	let omitted = false;
+	for (const line of String(text).split(/\r?\n/)) {
+		if (!line.trim()) continue;
+		let value;
+		try { value = JSON.parse(line); } catch { continue; }
+		if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+		if (!header && (value.type === "session" || value.type === "session_meta")) {
+			header = value;
+			continue;
+		}
+		if (records.length === maxEntries) {
+			records.shift();
+			omitted = true;
+		}
+		records.push(value);
+	}
+	return { header, records, omitted };
+}
+
 function memoryDocument(catalog, name) {
 	const validation = core.validateMemoryDocument(name, name === "summary" ? "v1" : "");
 	if (!validation.fileName) throw Object.assign(new Error("Memory document not found"), { code: "ENOENT" });
@@ -132,7 +230,41 @@ function createPiWebServer(options = {}) {
 		maxEntries: options.diskUsageMaxEntries,
 		maxDepth: options.diskUsageMaxDepth,
 	});
+	const chatAdapter = options.chatAdapter;
+	const eventHub = options.eventHub || chatCore.createChatEventHub();
+	const requestCache = chatCore.createRequestIdempotencyCache();
+	const pendingRequests = new Map();
+	const sseClients = new Set();
+	const sseHeartbeatMs = Number.isSafeInteger(options.sseHeartbeatMs) && options.sseHeartbeatMs > 0 ? options.sseHeartbeatMs : SSE_HEARTBEAT_MS;
+	const maxSseClients = Number.isSafeInteger(options.maxSseClients) && options.maxSseClients > 0 ? options.maxSseClients : SSE_CLIENT_LIMIT;
+	let unsubscribeAdapter;
 	let server;
+	if (!options.eventHub && typeof chatAdapter?.subscribe === "function") {
+		unsubscribeAdapter = chatAdapter.subscribe((event) => eventHub.publish(event));
+	}
+
+	function chatSnapshot() {
+		if (!chatAdapter || typeof chatAdapter.getSnapshot !== "function") throw chatError("CHAT_UNAVAILABLE", "Chat runtime is unavailable");
+		return publicChatSnapshot(chatAdapter.getSnapshot(), eventHub.cursor);
+	}
+
+	function requireAvailableSnapshot() {
+		const snapshot = chatSnapshot();
+		if (!snapshot.available || !snapshot.currentSessionId) throw chatError("CHAT_UNAVAILABLE", "Chat runtime is unavailable");
+		return snapshot;
+	}
+
+	function closeSseClient(client) {
+		if (!sseClients.delete(client)) return;
+		clearInterval(client.heartbeat);
+		client.unsubscribe();
+		if (!client.res.writableEnded) client.res.end();
+	}
+
+	function writeSse(client, value) {
+		if (client.res.writableEnded || client.res.destroyed) return closeSseClient(client);
+		if (!client.res.write(value)) closeSseClient(client);
+	}
 
 	async function listSessionRecords(query = "") {
 		const sessions = await (options.listSessions ? options.listSessions() : []);
@@ -146,7 +278,8 @@ function createPiWebServer(options = {}) {
 
 	function publicSession(session) {
 		const { path: _path, file: _file, allMessagesText: _searchText, ...safe } = session;
-		return { ...safe, current: session.id === options.getCurrentSessionId?.() };
+		const cwd = typeof session.cwd === "string" ? session.cwd : "";
+		return { ...safe, projectId: core.sha256Revision(`session-project\0${cwd}`), current: session.id === options.getCurrentSessionId?.() };
 	}
 
 	async function listSessions(query = "") {
@@ -166,16 +299,113 @@ function createPiWebServer(options = {}) {
 	}
 
 	async function handler(req, res) {
-		const requestUrl = new URL(req.url || "/", `http://${req.headers.host || `${host}:${port}`}`);
+		const requestUrl = new URL(req.url || "/", `http://${urlHost(host)}:${port}`);
 		try {
 			if (requestUrl.pathname.startsWith("/api/")) {
 				const address = server?.address();
-				const expectedHost = address && typeof address !== "string" ? `${urlHost(host)}:${address.port}` : undefined;
-				if (!expectedHost || req.headers.host !== expectedHost) return json(res, 403, { error: "Host is not allowed" });
+				const boundPort = address && typeof address !== "string" ? address.port : undefined;
+				if (!boundPort || !isAllowedLoopbackHost(req.headers.host, boundPort)) return json(res, 403, { error: "Host is not allowed" });
 				if (!["GET", "HEAD"].includes(req.method || "GET")) {
-					const address = server?.address();
-					const allowedOrigin = address && typeof address !== "string" ? `http://${urlHost(host)}:${address.port}` : undefined;
-					if (!req.headers.origin || req.headers.origin !== allowedOrigin) return json(res, 403, { error: "Origin is not allowed" });
+					if (!isAllowedLoopbackOrigin(req.headers.origin, boundPort)) return json(res, 403, { error: "Origin is not allowed" });
+				}
+				if (requestUrl.pathname === "/api/chat/snapshot" && req.method === "GET") {
+					return json(res, 200, chatSnapshot());
+				}
+				if (requestUrl.pathname === "/api/chat/history" && req.method === "GET") {
+					const snapshot = requireAvailableSnapshot();
+					if (typeof chatAdapter.getCurrentSessionRecord !== "function") throw chatError("CHAT_UNAVAILABLE", "Chat history is unavailable");
+					const record = await chatAdapter.getCurrentSessionRecord();
+					if (!record || record.id !== snapshot.currentSessionId || typeof record.path !== "string") throw chatError("SESSION_CHANGED", "Current session changed");
+					let document;
+					try { document = readSessionDocumentTail(record.path); }
+					catch { throw chatError("CHAT_HISTORY_UNAVAILABLE", "Chat history is unavailable"); }
+					const recent = parseRecentSessionRecords(document.text);
+					const sessionId = recent.header?.id ?? recent.header?.sessionId ?? recent.header?.payload?.id;
+					if (sessionId && sessionId !== snapshot.currentSessionId) throw chatError("SESSION_CHANGED", "Current session changed");
+					const activeBranch = core.selectActiveSessionBranch(recent.records);
+					const history = core.normalizeSessionChatHistory(activeBranch, { maxEntries: CHAT_HISTORY_ENTRIES });
+					return json(res, 200, {
+						sessionId: snapshot.currentSessionId,
+						revision: document.truncated ? undefined : core.sha256Revision(document.text),
+						truncated: document.truncated || recent.omitted || history.metadata.truncated || history.metadata.contentTruncated,
+						entries: history.entries,
+					});
+				}
+				if (requestUrl.pathname === "/api/chat/messages" && req.method === "POST") {
+					const body = chatCore.validateChatMessageInput(await readJson(req));
+					const snapshot = requireAvailableSnapshot();
+					if (body.sessionId !== snapshot.currentSessionId) throw chatError("SESSION_CHANGED", "Current session changed");
+					const cached = requestCache.get(body.requestId);
+					if (cached) return json(res, 202, cached);
+					if (pendingRequests.has(body.requestId)) return json(res, 202, await pendingRequests.get(body.requestId));
+					if (typeof chatAdapter.sendUserMessage !== "function") throw chatError("CHAT_UNAVAILABLE", "Sending chat messages is unavailable");
+					const operation = Promise.resolve(chatAdapter.sendUserMessage({ requestId: body.requestId, text: body.text })).then((acceptance) => {
+						const result = {
+							accepted: true,
+							requestId: body.requestId,
+							delivery: acceptance?.delivery === "followUp" ? "followUp" : "immediate",
+						};
+						requestCache.set(body.requestId, result);
+						return result;
+					});
+					pendingRequests.set(body.requestId, operation);
+					try { return json(res, 202, await operation); }
+					finally { pendingRequests.delete(body.requestId); }
+				}
+				if (requestUrl.pathname === "/api/chat/abort" && req.method === "POST") {
+					const body = await readJson(req);
+					if (!UUID_RE.test(body.sessionId) || !UUID_RE.test(body.runId)) throw chatError("INVALID_CHAT_MESSAGE", "sessionId and runId must be UUIDs");
+					const snapshot = requireAvailableSnapshot();
+					if (body.sessionId !== snapshot.currentSessionId || body.runId !== snapshot.activeRun?.runId) throw chatError("RUN_CHANGED", "Current run changed");
+					if (typeof chatAdapter.abort !== "function") throw chatError("CHAT_UNAVAILABLE", "Chat abort is unavailable");
+					await chatAdapter.abort({ sessionId: body.sessionId, runId: body.runId });
+					return json(res, 202, { accepted: true, sessionId: body.sessionId, runId: body.runId });
+				}
+				if (requestUrl.pathname === "/api/chat/events" && req.method === "GET") {
+					const snapshot = requireAvailableSnapshot();
+					const rawCursor = req.headers["last-event-id"] ?? requestUrl.searchParams.get("lastEventId") ?? "0";
+					if (typeof rawCursor !== "string" || !/^\d+$/.test(rawCursor) || !Number.isSafeInteger(Number(rawCursor))) throw chatError("INVALID_EVENT_CURSOR", "Last-Event-ID must be a non-negative integer");
+					if (sseClients.size >= maxSseClients) throw chatError("SSE_CLIENT_LIMIT", "Too many chat event clients");
+					res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store", connection: "keep-alive", "x-accel-buffering": "no" });
+					res.flushHeaders?.();
+					const client = { res, heartbeat: undefined, unsubscribe: () => {}, replaying: true, pending: [] };
+					client.unsubscribe = eventHub.subscribe((event) => {
+						const controlEvent = event.type === "session.changed" || event.type === "stream.reset";
+						if (!controlEvent && event.sessionId !== snapshot.currentSessionId) return;
+						if (client.replaying) client.pending.push(event);
+						else writeSse(client, sseFrame(event));
+					});
+					client.heartbeat = setInterval(() => writeSse(client, `: heartbeat ${Date.now()}\n\n`), sseHeartbeatMs);
+					client.heartbeat.unref?.();
+					sseClients.add(client);
+					const close = () => closeSseClient(client);
+					req.once("close", close);
+					res.once("close", close);
+					const replay = eventHub.replay(Number(rawCursor));
+					let lastWrittenId = Number(rawCursor);
+					if (replay.reset) {
+						// The global hub cannot prove which session owned an evicted event.
+						// Reset conservatively rather than risk silently losing current-session data.
+						writeSse(client, sseFrame({ id: replay.cursor, type: "stream.reset", timestamp: Date.now(), sessionId: snapshot.currentSessionId, data: { reason: replay.reason, cursor: replay.cursor } }));
+						lastWrittenId = replay.cursor;
+					} else {
+						for (const event of replay.events) {
+							const controlEvent = event.type === "session.changed" || event.type === "stream.reset";
+							if (controlEvent || event.sessionId === snapshot.currentSessionId) {
+								writeSse(client, sseFrame(event));
+								lastWrittenId = Math.max(lastWrittenId, event.id);
+							}
+					}
+					}
+					client.replaying = false;
+					for (const event of client.pending.sort((a, b) => a.id - b.id)) {
+						if (event.id > lastWrittenId) {
+							writeSse(client, sseFrame(event));
+							lastWrittenId = event.id;
+						}
+					}
+					client.pending.length = 0;
+					return;
 				}
 				if (requestUrl.pathname === "/api/disk-usage" && req.method === "GET") {
 					const sort = requestUrl.searchParams.get("sort") || "size";
@@ -202,8 +432,20 @@ function createPiWebServer(options = {}) {
 					if (!item?.path) return json(res, 404, { error: "Session not found" });
 					const current = item.id === options.getCurrentSessionId?.();
 					if (req.method === "GET") {
-						const sessionDocument = core.readTextBounded(item.path, SESSION_LIMIT);
-						return json(res, 200, { session: publicSession(item), current, sourceTruncated: sessionDocument.truncated, revision: sessionDocument.truncated ? undefined : core.sha256Revision(sessionDocument.text), ...core.parseSessionJsonl(sessionDocument.text, { maxEntries: 2000 }) });
+						const sessionDocument = readSessionDocumentTail(item.path);
+						const parsed = core.parseSessionJsonl(sessionDocument.text, { maxEntries: 2000, keepLatest: true });
+						const activeBranch = core.selectActiveSessionBranch(parsed.entries);
+						const history = core.normalizeSessionChatHistory(activeBranch, { maxEntries: 2000 });
+						return json(res, 200, {
+							session: publicSession(item),
+							current,
+							sourceTruncated: sessionDocument.truncated,
+							revision: sessionDocument.truncated ? undefined : core.sha256Revision(sessionDocument.text),
+							summary: parsed.summary,
+							diagnostics: parsed.diagnostics,
+							chatHistory: history.entries,
+							chatHistoryMetadata: history.metadata,
+						});
 					}
 					if (req.method === "PATCH") {
 						const body = await readJson(req);
@@ -310,14 +552,26 @@ function createPiWebServer(options = {}) {
 			try { file = core.resolveContainedPath(publicDir, relative); } catch { return json(res, 404, { error: "Not found" }); }
 			if (!fs.existsSync(file) || !fs.statSync(file).isFile()) return json(res, 404, { error: "Not found" });
 			const data = fs.readFileSync(file);
-			res.writeHead(200, { "content-type": contentType(file), "content-length": data.length, "cache-control": "no-cache", "x-content-type-options": "nosniff", "content-security-policy": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'" }); res.end(data);
+			const immutableAsset = /^assets\/[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$/.test(relative);
+			res.writeHead(200, { "content-type": contentType(file), "content-length": data.length, "cache-control": immutableAsset ? "public, max-age=31536000, immutable" : "no-cache", "x-content-type-options": "nosniff", "content-security-policy": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'" }); res.end(data);
 		} catch (error) { json(res, errorStatus(error), { error: error instanceof Error ? error.message : String(error), code: error?.code }); }
 	}
 
 	return {
 		host, requestedPort: port, catalog,
 		async start() { if (server?.listening) return this.address(); server = http.createServer(handler); server.on("clientError", (_error, socket) => socket.end("HTTP/1.1 400 Bad Request\r\n\r\n")); await new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, host, resolve); }); return this.address(); },
-		async stop() { if (!server) return; const current = server; server = undefined; await new Promise((resolve) => current.close(() => resolve())); },
+		async stop() {
+			for (const client of [...sseClients]) closeSseClient(client);
+			unsubscribeAdapter?.();
+			unsubscribeAdapter = undefined;
+			requestCache.clear();
+			pendingRequests.clear();
+			if (!server) return;
+			const current = server; server = undefined;
+			const closed = new Promise((resolve) => current.close(() => resolve()));
+			current.closeAllConnections?.();
+			await closed;
+		},
 		address() { const address = server?.address(); if (!address || typeof address === "string") return undefined; return { host, port: address.port, url: `http://${urlHost(host)}:${address.port}/` }; },
 		handler,
 	};

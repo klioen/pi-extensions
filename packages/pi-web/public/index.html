@@ -1,88 +1,15 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="dark">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark light">
-  <meta name="description" content="Pi Web Control Deck">
-  <title>Pi Control Deck</title>
-  <link rel="stylesheet" href="./app.css">
-</head>
-<body>
-  <a class="skip-link" href="#main">跳到主要内容</a>
-  <div class="app-shell">
-    <aside class="sidebar" id="sidebar" aria-label="主导航">
-      <div class="brand">
-        <span class="brand-mark" aria-hidden="true">π</span>
-        <span><strong>PI WEB</strong><small>CONTROL DECK</small></span>
-      </div>
-      <nav class="nav-list">
-        <a href="#/overview" data-route="overview"><span aria-hidden="true">◫</span> Overview</a>
-        <a href="#/sessions" data-route="sessions"><span aria-hidden="true">⌁</span> Sessions</a>
-        <a href="#/skills" data-route="skills"><span aria-hidden="true">◇</span> Skills</a>
-        <a href="#/extensions" data-route="extensions"><span aria-hidden="true">⬡</span> Extensions</a>
-        <a href="#/disk" data-route="disk"><span aria-hidden="true">▤</span> Disk Usage</a>
-        <a href="#/memory" data-route="memory"><span aria-hidden="true">◎</span> Memory</a>
-      </nav>
-      <div class="sidebar-footer">
-        <span class="status-dot" id="connection-dot" aria-hidden="true"></span>
-        <span id="connection-status">Connecting</span>
-      </div>
-    </aside>
-
-    <div class="workspace">
-      <header class="topbar">
-        <button class="icon-button menu-button" id="menu-button" type="button" aria-label="打开导航" aria-controls="sidebar" aria-expanded="false">☰</button>
-        <div class="page-heading">
-          <p class="eyebrow">LOCAL OPERATIONS</p>
-          <h1 id="page-title">Overview</h1>
-        </div>
-        <div class="topbar-actions">
-          <label class="theme-control">
-            <span>Theme</span>
-            <select id="theme-select" aria-label="颜色主题">
-              <option value="dark">Dark</option>
-              <option value="light">Light</option>
-              <option value="system">System</option>
-            </select>
-          </label>
-          <button class="icon-button" id="refresh-button" type="button" aria-label="刷新当前页面" title="刷新">↻</button>
-        </div>
-      </header>
-
-      <main id="main" tabindex="-1">
-        <div id="view" aria-live="polite" aria-busy="true"></div>
-      </main>
-    </div>
-  </div>
-
-  <div class="sidebar-scrim" id="sidebar-scrim" hidden></div>
-  <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
-
-  <dialog id="confirm-dialog" class="dialog">
-    <form method="dialog">
-      <p class="eyebrow">CONFIRM ACTION</p>
-      <h2 id="confirm-title">确认操作</h2>
-      <p id="confirm-message"></p>
-      <div class="dialog-actions">
-        <button class="button secondary" value="cancel">取消</button>
-        <button class="button danger" id="confirm-action" value="confirm">确认</button>
-      </div>
-    </form>
-  </dialog>
-
-  <dialog id="rename-dialog" class="dialog">
-    <form method="dialog" id="rename-form">
-      <p class="eyebrow">RENAME SESSION</p>
-      <h2>重命名 Session</h2>
-      <label class="dialog-field">名称<input id="rename-input" name="name" maxlength="200" required autocomplete="off"></label>
-      <div class="dialog-actions">
-        <button class="button secondary" value="cancel">取消</button>
-        <button class="button primary" value="confirm">保存</button>
-      </div>
-    </form>
-  </dialog>
-
-  <script src="./app.js" defer></script>
-</body>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="description" content="Pi Web Control Deck" />
+    <title>Pi Web</title>
+    <script type="module" crossorigin src="./assets/index-BLSfzhH2.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-BAO0ZHu4.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
 </html>

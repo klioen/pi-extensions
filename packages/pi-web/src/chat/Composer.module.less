@@ -1,0 +1,13 @@
+.srOnly { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.composer { width: min(var(--chat-composer-width, 800px), calc(100% - 24px)); margin: 0 auto; padding: 14px 16px 12px; display: flex; flex-direction: column; background: var(--surface); border: 1px solid color-mix(in srgb, var(--muted) 35%, transparent); border-radius: 24px; }
+.hero { min-height: 160px; padding: 22px 20px 16px; border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); }
+.compact { min-height: 126px; box-shadow: 0 6px 24px var(--shadow-overlay); }
+.composer textarea { width: 100%; min-height: 48px; max-height: 240px; resize: none; padding: 0; color: var(--text); background: transparent; border: 0; outline: 0; font: 15px/1.55 var(--sans); }
+.hero textarea { min-height: 70px; }
+.footer { margin-top: auto; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.hint { color: var(--muted); font-size: 11px; }
+.action { min-width: 76px; padding: 8px 14px; color: var(--primary-contrast); border: 0; border-radius: 999px; cursor: pointer; }
+.action:disabled { cursor: not-allowed; opacity: .55; }
+.primary { background: var(--primary); }
+.danger { background: var(--danger); }
+@media (max-width: 720px) { .composer { width: calc(100% - 24px); border-radius: 20px; } .hero { min-height: 150px; } .compact { min-height: 116px; } .hint { display: none; } }

@@ -1,4 +1,25 @@
+import type { ChatAcceptance, ChatEventEnvelope, ChatEventHub } from "../lib/chat-core.cjs";
+
 export interface PiWebAddress { host: string; port: number; url: string }
+export interface PiWebChatSnapshot {
+  available: boolean;
+  currentSessionId?: string;
+  sessionName?: string;
+  cwd?: string;
+  idle: boolean;
+  hasPendingMessages: boolean;
+  activeRun: null | { runId: string; state?: string; [key: string]: unknown };
+  eventCursor?: number;
+  capabilities: Record<string, boolean>;
+}
+export interface PiWebCurrentSessionRecord { id: string; path: string }
+export interface PiWebChatAdapter {
+  getSnapshot(): PiWebChatSnapshot;
+  getCurrentSessionRecord(): Promise<PiWebCurrentSessionRecord | undefined> | PiWebCurrentSessionRecord | undefined;
+  sendUserMessage(input: { requestId: string; text: string }): Promise<ChatAcceptance> | ChatAcceptance;
+  abort(input: { sessionId: string; runId: string }): Promise<void> | void;
+  subscribe?(listener: (event: Omit<ChatEventEnvelope, "id" | "timestamp"> & { timestamp?: number }) => void): () => void;
+}
 export interface PiWebServerOptions {
   host?: string;
   port?: number;
@@ -13,6 +34,10 @@ export interface PiWebServerOptions {
   diskUsageMaxDepth?: number;
   publicDir?: string;
   projectTrusted?: boolean;
+  chatAdapter?: PiWebChatAdapter;
+  eventHub?: ChatEventHub;
+  sseHeartbeatMs?: number;
+  maxSseClients?: number;
   listSessions?: () => Promise<any[]>;
   listEffectiveSkills?: () => any[];
   getCurrentSessionId?: () => string | undefined;

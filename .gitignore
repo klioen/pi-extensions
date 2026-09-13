@@ -1,2 +1,4 @@
 node_modules/
+packages/pi-web/.vite-smoke/
+*.tsbuildinfo
 *.log

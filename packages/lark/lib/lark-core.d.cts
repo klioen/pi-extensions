@@ -11,4 +11,3 @@ export function isLarkSkill(value: unknown): value is NamedSkill;
 export function filterLarkSkills<T>(skills?: T[]): T[];
 export function filterLarkSkillsFromPrompt(prompt: string): string;
 export function normalizeLarkState(value: unknown): LarkState;
-export function buildLarkPrompt(enabled: boolean): string;

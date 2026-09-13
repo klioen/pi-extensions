@@ -1,0 +1,27 @@
+.workbench { --chat-thread-width: 960px; --chat-composer-width: 800px; --chat-user-width: 720px; width: 100%; min-width: 0; max-width: 100%; height: 100%; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; position: relative; overflow-x: hidden; container: chat-area / inline-size; }
+.subheader { min-height: 58px; padding: 8px 18px 10px; display: flex; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 1px solid var(--border); }
+.session { min-width: 0; display: grid; gap: 2px; }
+.session strong { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.sessionId { overflow: hidden; color: var(--muted); font: 11px/1.4 var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+.runtime { display: flex; align-items: center; justify-content: flex-end; gap: 10px; color: var(--muted); font-size: 12px; }
+.connection::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; }
+.connected::before { background: var(--success); }
+.disconnected::before { background: var(--primary); }
+.error { max-width: 280px; overflow: hidden; color: var(--danger); text-overflow: ellipsis; white-space: nowrap; }
+.runtime button { padding: 3px 8px; color: var(--primary); background: transparent; border: 1px solid color-mix(in srgb, var(--primary) 35%, transparent); border-radius: 999px; cursor: pointer; }
+.empty { min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 34px; padding: 32px 20px 56px; text-align: center; }
+.unavailable { min-height: 0; display: grid; align-content: center; justify-items: center; padding: 32px 20px 56px; text-align: center; }
+.unavailable h2 { margin: 18px 0 5px; font-size: 24px; }
+.unavailable p { max-width: 480px; margin: 0; color: var(--muted); }
+.welcome { display: grid; justify-items: center; }
+.mark { width: 48px; height: 48px; display: grid; place-items: center; color: var(--primary-contrast); background: var(--primary); border-radius: 14px; font: 700 27px Georgia, serif; }
+.welcome h2 { margin: 18px 0 5px; font-size: 24px; }
+.welcome p { margin: 0; color: var(--muted); }
+.composerDock { padding: 12px 0 4px; }
+.skeleton { width: min(960px, calc(100% - 40px)); margin: 0 auto; padding: 40px 0; display: grid; align-content: start; gap: 18px; }
+.skeleton span { height: 70px; background: linear-gradient(90deg, color-mix(in srgb, var(--muted) 9%, transparent), color-mix(in srgb, var(--muted) 17%, transparent), color-mix(in srgb, var(--muted) 9%, transparent)); background-size: 200% 100%; border-radius: 16px; animation: shimmer 1.4s ease-in-out infinite; }
+.skeleton span:nth-child(2) { width: 68%; justify-self: end; }
+.skeleton span:nth-child(3) { width: 82%; }
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+@media (prefers-reduced-motion: reduce) { .skeleton span { animation: none; } }
+@media (max-width: 720px) { .workbench { min-height: 480px; } .subheader { align-items: flex-start; padding-inline: 8px; } .runtime { flex-wrap: wrap; gap: 6px 10px; } .sessionId { max-width: 38vw; } .error { max-width: 42vw; } .empty { padding-inline: 0; } }

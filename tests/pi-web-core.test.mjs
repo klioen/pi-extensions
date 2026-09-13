@@ -11,11 +11,13 @@ import {
 	catalogSettings,
 	catalogSkills,
 	isPathContained,
+	normalizeSessionChatHistory,
 	parseSessionJsonl,
 	parseSkillFrontmatter,
 	readTextBounded,
 	readTailLinesBounded,
 	removeSessionWithRevision,
+	selectActiveSessionBranch,
 	renameSessionWithRevision,
 	resolveContainedPath,
 	serializeSkillDocument,
@@ -180,6 +182,92 @@ test("session JSONL parsing returns header, bounded entries, diagnostics, and su
 	assert.equal(parsed.diagnostics[0].line, 3);
 	assert.equal(parsed.entries.length, 2);
 	assert.ok(parsed.summary.lastTimestamp > parsed.summary.firstTimestamp);
+});
+
+test("session active branch follows the last leaf and excludes abandoned siblings", () => {
+	const records = [
+		{ type: "message", id: "u1", parentId: null, message: { role: "user", content: "start" } },
+		{ type: "message", id: "a1", parentId: "u1", message: { role: "assistant", content: "answer" } },
+		{ type: "message", id: "abandoned", parentId: "a1", message: { role: "user", content: "abandoned branch" } },
+		{ type: "compaction", id: "compact", parentId: "a1", summary: "context only", firstKeptEntryId: "u1" },
+		{ type: "message", id: "u2", parentId: "compact", message: { role: "user", content: "active branch" } },
+		{ type: "message", id: "a2", parentId: "u2", message: { role: "assistant", content: "latest" } },
+	];
+	const selected = selectActiveSessionBranch(records);
+	assert.deepEqual(selected.map((record) => record.id), ["u1", "a1", "compact", "u2", "a2"]);
+	assert.deepEqual(normalizeSessionChatHistory(selected).entries.map((entry) => entry.id), ["u1", "a1", "u2", "a2"]);
+});
+
+test("session active branch preserves legacy records without parentId as linear history", () => {
+	const records = [
+		{ type: "message", id: "old", message: { role: "user", content: "old" } },
+		{ type: "message", id: "new", message: { role: "assistant", content: "new" } },
+	];
+	assert.equal(selectActiveSessionBranch(records), records);
+});
+
+test("session chat history preserves raw displayable content within structural bounds", () => {
+	const records = [
+		{ type: "message", id: "u1", parentId: "secret-parent", timestamp: "2026-01-01T00:00:00Z", path: "/private/session.jsonl", message: { role: "user", content: [{ type: "text", text: "Hello" }, { type: "image", data: "base64-secret", mimeType: "image/png" }], credentials: "NOPE" } },
+		{ type: "message", id: "a1", timestamp: "2026-01-01T00:00:01Z", message: { role: "assistant", content: [
+			{ type: "thinking", thinking: "Inspect cwd:/etc/shadow, comma,/var/private, `/opt/hidden`, file:///Users/alice/private, \\\\server\\share\\secret.txt, AKIAIOSFODNN7EXAMPLE and -----BEGIN PGP MESSAGE-----\nPGP_SECRET Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature", thinkingSignature: "SIGNED_SECRET", details: { token: "NOPE" } },
+			{ type: "thinking", thinking: "REDACTED_MUST_NOT_LEAK", redacted: true },
+			{ type: "text", text: "I will check." },
+			{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "cat /private/key", nested: { query: "needle", token: "NOPE" }, credentials: "NOPE" }, path: "/private/key" },
+		], provider: "secret-provider", credentials: "NOPE" } },
+		{ type: "message", id: "t1", timestamp: "2026-01-01T00:00:02Z", message: { role: "toolResult", toolCallId: "call-1", toolName: "bash", content: [{ type: "text", text: "command completed" }], isError: false, details: { path: "/private/key", credentials: "NOPE" } } },
+		{ type: "message", id: "c1", timestamp: "2026-01-01T00:00:03Z", message: { role: "custom", customType: "status", display: true, content: "Index refreshed", details: { path: "/private/index" } } },
+		{ type: "message", id: "hidden", message: { role: "custom", customType: "internal", display: false, content: "hidden custom message" } },
+		{ type: "message", id: "system", message: { role: "system", content: "system prompt" } },
+		{ type: "custom_message", id: "cm1", timestamp: "2026-01-01T00:00:04Z", customType: "notice", display: true, content: [{ type: "text", text: "Visible notice" }], details: { credentials: "NOPE" } },
+	];
+	const history = normalizeSessionChatHistory(records);
+	assert.deepEqual(history.entries, [
+		{ id: "u1", role: "user", timestamp: "2026-01-01T00:00:00Z", content: [{ type: "text", text: "Hello" }] },
+		{ id: "a1", role: "assistant", timestamp: "2026-01-01T00:00:01Z", content: [
+			{ type: "thinking", text: "Inspect cwd:/etc/shadow, comma,/var/private, `/opt/hidden`, file:///Users/alice/private, \\\\server\\share\\secret.txt, AKIAIOSFODNN7EXAMPLE and -----BEGIN PGP MESSAGE-----\nPGP_SECRET Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature" },
+			{ type: "thinking", text: "REDACTED_MUST_NOT_LEAK" },
+			{ type: "text", text: "I will check." },
+			{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "cat /private/key", nested: { query: "needle", token: "NOPE" }, credentials: "NOPE" } },
+		] },
+		{ id: "t1", role: "toolResult", timestamp: "2026-01-01T00:00:02Z", toolCallId: "call-1", toolName: "bash", isError: false, content: [{ type: "text", text: "command completed" }] },
+		{ id: "c1", role: "custom", timestamp: "2026-01-01T00:00:03Z", customType: "status", content: [{ type: "text", text: "Index refreshed" }] },
+		{ id: "cm1", role: "custom", timestamp: "2026-01-01T00:00:04Z", customType: "notice", content: [{ type: "text", text: "Visible notice" }] },
+	]);
+	assert.deepEqual(history.metadata, { sourceEntries: 7, displayableEntries: 5, returnedEntries: 5, omittedEntries: 0, truncated: false, contentTruncated: false });
+	const serialized = JSON.stringify(history);
+	for (const visible of ["/etc/shadow", "/var/private", "/opt/hidden", "/Users/alice/private", "AKIAIOSFODNN7EXAMPLE", "PGP_SECRET", "eyJhbGci", "REDACTED_MUST_NOT_LEAK", "/private/key", "credentials", "NOPE"]) assert.match(serialized, new RegExp(visible.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+	assert.doesNotMatch(serialized, /private\/session|details|secret-provider|base64-secret|hidden custom|system prompt|SIGNED_SECRET|thinkingSignature/);
+});
+
+test("session chat history preserves interleaved assistant block order", () => {
+	const history = normalizeSessionChatHistory([{ type: "message", id: "a1", message: { role: "assistant", content: [
+		{ type: "thinking", thinking: "first thought" },
+		{ type: "text", text: "first answer" },
+		{ type: "toolCall", id: "call-1", name: "read", arguments: {} },
+		{ type: "thinking", thinking: "second thought" },
+		{ type: "text", text: "second answer" },
+	] } }]);
+	assert.deepEqual(history.entries[0].content.map((block) => block.type), ["thinking", "text", "toolCall", "thinking", "text"]);
+});
+
+test("session chat history preserves secrets and absolute paths in visible text", () => {
+	const history = normalizeSessionChatHistory([
+		{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "token=sk-abcdefghijklmnop Authorization: Basic dXNlcjpwYXNz\nat /Users/alice/.ssh/id_rsa" }] } },
+		{ type: "message", message: { role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "API_KEY=super-secret Cookie: sid=cookie-secret; refresh=also-secret\n/home/bob/private.txt" }] } },
+	]);
+	const serialized = JSON.stringify(history);
+	for (const visible of ["abcdefghijklmnop", "super-secret", "dXNlcjpwYXNz", "cookie-secret", "also-secret", "/Users/alice", "/home/bob"]) assert.match(serialized, new RegExp(visible.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+test("session chat history bounds recent entries and text with explicit truncation metadata", () => {
+	const records = [
+		{ type: "message", id: "old", message: { role: "user", content: "old" } },
+		{ type: "message", id: "new", message: { role: "assistant", content: [{ type: "text", text: "123456789" }, { type: "toolCall", id: "call-2", name: "read", arguments: { path: "/secret" } }] } },
+	];
+	const history = normalizeSessionChatHistory(records, { maxEntries: 1, maxTextChars: 5 });
+	assert.deepEqual(history.entries, [{ id: "new", role: "assistant", content: [{ type: "text", text: "12345", truncated: true }, { type: "toolCall", id: "call-2", name: "read", arguments: { path: "/secret" } }] }]);
+	assert.deepEqual(history.metadata, { sourceEntries: 2, displayableEntries: 2, returnedEntries: 1, omittedEntries: 1, truncated: true, contentTruncated: true });
 });
 
 test("session summaries normalize, query, and sort listAll-shaped records", () => {

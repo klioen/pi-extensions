@@ -1,7 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-	buildLarkPrompt,
 	filterLarkSkills,
 	filterLarkSkillsFromPrompt,
 	isLarkSkill,
@@ -66,11 +65,4 @@ test("normalizes persisted state conservatively", () => {
 	assert.deepEqual(normalizeLarkState({ enabled: false }), { enabled: false });
 	assert.deepEqual(normalizeLarkState({ enabled: "true" }), { enabled: false });
 	assert.deepEqual(normalizeLarkState(null), { enabled: false });
-});
-
-test("mode prompts state the current routing behavior", () => {
-	assert.match(buildLarkPrompt(true), /LARK MODE: ON/);
-	assert.match(buildLarkPrompt(true), /lark-/);
-	assert.match(buildLarkPrompt(false), /LARK MODE: OFF/);
-	assert.match(buildLarkPrompt(false), /not available/i);
 });

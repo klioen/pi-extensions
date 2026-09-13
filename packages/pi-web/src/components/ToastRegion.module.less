@@ -1,0 +1,19 @@
+.region { position: fixed; z-index: 80; right: 18px; bottom: 18px; display: grid; gap: 8px; }
+.toast {
+  width: min(380px, calc(100vw - 36px));
+  padding: 11px 12px 11px 14px;
+  display: flex;
+  align-items: start;
+  gap: 12px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--primary);
+  border-radius: var(--radius-nav);
+  box-shadow: var(--shadow-float);
+
+  span { flex: 1; }
+  button { padding: 0; color: var(--text-muted); background: none; border: 0; font-size: 18px; }
+}
+.success { border-left-color: var(--success); }
+.error { border-left-color: var(--danger); }
+.info { border-left-color: var(--info); }
