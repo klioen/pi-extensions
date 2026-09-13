@@ -33,8 +33,9 @@ describe("AppShell", () => {
     expect(screen.getByRole("button", { name: "Expand sidebar" })).toBeInTheDocument();
   });
 
-  it("loads projects and navigates from the sidebar using the complete cwd", async () => {
+  it("hides the Sessions navigation item while keeping Projects navigation", async () => {
     render(<App />);
+    expect(screen.queryByRole("link", { name: "Sessions" })).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Projects", level: 2 })).toBeInTheDocument();
     const project = await screen.findByTitle("/work/foundation");
     expect(screen.getByTitle("/archive/foundation")).toBeInTheDocument();

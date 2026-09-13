@@ -6,7 +6,7 @@ import { appStore, setMobileMenu, setProjects, toggleSidebar } from "../app/stor
 import styles from "./Sidebar.module.less";
 
 const navigation = [
-  ["overview", "Overview", "◫"], ["chat", "Chat", "✦"], ["sessions", "Sessions", "⌁"],
+  ["overview", "Overview", "◫"], ["chat", "Chat", "✦"],
   ["skills", "Skills", "◇"], ["extensions", "Extensions", "⬡"], ["disk", "Disk Usage", "▤"], ["memory", "Memory", "◎"],
 ] as const;
 
