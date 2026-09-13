@@ -13,6 +13,10 @@ description: >-
 
 每个会话在人类看到之前先自验证，并修复自己的错误。验证是"完成"的一部分，不是事后动作。
 
+## SDLC 产物路径（强制）
+
+验证变更时，将 `docs/<change-slug>/{intent.md,spec.md,plan.md}` 作为需求、设计和证明计划的唯一文档基线。若新变更把这些文件放在仓库根目录、`plans/`、`intent/` 或不同目录，验证失败；同一交付周期内的方案修改更新原目录，独立 bugfix 或 incident 使用新的 change slug。
+
 ## 适用场景
 
 - 写完代码要确认能用

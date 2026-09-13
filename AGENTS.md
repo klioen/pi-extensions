@@ -34,6 +34,7 @@ Custom pi coding-agent packages. Root `package.json` exposes the umbrella runtim
 ## Conventions
 
 - Project instructions live in `AGENTS.md`, never `CLAUDE.md`.
+- All SDLC artifacts live under `docs/<change-slug>/{intent.md,spec.md,plan.md}`. A change slug is a stable kebab-case delivery unit; update its directory within one delivery cycle, but use a new slug for a new post-delivery objective, bugfix, or incident. Never create root artifact files or `plans/`/`intent/` artifact directories.
 - Packages are under `packages/<name>`; Node built-in `node:test` is the test framework.
 - Root runtime extension order is `env`, `web-access`, `subagents`, `todo`, `plan`, `lark`, `failover`, `memory`, `loop`, `pi-web`.
 - Runtime dependencies must be zero or declared in `dependencies`; pi core packages are peer-provided. Pi Web frontend dependencies are bundled by Vite, and extension/server code must not import them at runtime.

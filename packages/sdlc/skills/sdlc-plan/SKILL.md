@@ -11,6 +11,22 @@ description: >-
 
 想法不再等人写文档。意图只捕获一次，存成版本化 artifact（`intent.md`），下一个阶段直接读它行动。
 
+## 产物路径（强制）
+
+所有 SDLC 产物严格放在同一个变更目录：
+
+```text
+docs/<change-slug>/
+├── intent.md
+├── spec.md
+└── plan.md
+```
+
+- `<change-slug>` 是稳定、可读的 kebab-case 独立变更名，例如 `pi-web-chat`、`fix-memory-worker-lease-race`、`incident-api-timeout`。
+- 同一目标、同一交付周期内调整方案，更新原目录；已经交付或形成新的独立验收目标，创建新的 change slug。
+- 禁止在仓库根目录创建 `intent.md`、`spec.md`、`plan.md`，也禁止使用 `plans/`、`intent/` 等分散目录。
+- 同一变更的三个文件必须放在同一目录。创建 intent 时就确定目录，后续阶段复用该路径，不覆盖其他变更的文档。
+
 ## 适用场景
 
 - 用户提出新想法/新功能/新需求/改造方向
@@ -32,7 +48,7 @@ description: >-
 
 ### Step 2 — 产出 `intent.md`
 
-用下面的模板把澄清结果写成 `intent.md`（仓库根 `intent/` 目录或文档目录，随项目约定），提交到 git。
+先确定 `<change-slug>`，再用下面的模板把澄清结果写入 `docs/<change-slug>/intent.md`，提交到 git。
 
 ```
 # Intent: <简短标题>
@@ -56,28 +72,28 @@ Author: <提出人>。 Status: draft。
 
 ### Step 3 — 确认
 
-- 把 `intent.md` 给用户（需求方/负责人）确认，修正误解
+- 把 `docs/<change-slug>/intent.md` 给用户（需求方/负责人）确认，修正误解
 - **接受/拒绝**记录为 git 的 merge/close review
 
 ### Step 4 — 产出 `spec.md`（需求+设计合一）
 
-被接受的 `intent.md` 进入设计：
+被接受的 `docs/<change-slug>/intent.md` 进入设计：
 
 1. 读取项目约定（`AGENTS.md`、现有代码结构）
-2. 产出 `spec.md`：
+2. 在同一目录产出 `docs/<change-slug>/spec.md`：
    - 需求：把 intent 转成可规划的需求
    - 设计：涉及的系统/模块/接口变更
    - **concern 标记**：无法同时满足的冲突政策、风险点、需要政策负责人裁决的地方，显式标出
-3. 设计完成后把 `spec.md` 与 `intent.md` 一起提交（文件对记录"要了什么、定了什么"）
+3. 设计完成后把同目录的 `spec.md` 与 `intent.md` 一起提交（文件对记录"要了什么、定了什么"）
 
 ### Step 5 — 人类决策
 
-- `spec.md` 交给负责人/技术负责人 review（高风险变更必须人工）
+- `docs/<change-slug>/spec.md` 交给负责人/技术负责人 review（高风险变更必须人工）
 - **接受 spec = 进入 build 阶段**（触发 sdlc-build）
 
 ## 产物与审计
 
-- `intent.md` + `spec.md` 提交进 git（作者、时间戳、修订历史 = 审计链）
+- `docs/<change-slug>/intent.md` + `docs/<change-slug>/spec.md` 提交进 git（作者、时间戳、修订历史 = 审计链）
 - 后续 review（sdlc-review）用 spec 对照"改的是不是被批准的东西"
 
 ## 衡量

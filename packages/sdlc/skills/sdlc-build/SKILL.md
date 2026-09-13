@@ -11,6 +11,21 @@ description: >-
 
 没有获批的计划不动手。制度知识变成 agent 每会话读取的文件（`AGENTS.md`），护栏用代码运行而不是靠习惯。
 
+## 产物路径（强制）
+
+实现计划必须与对应 intent/spec 位于同一变更目录：
+
+```text
+docs/<change-slug>/
+├── intent.md
+├── spec.md
+└── plan.md
+```
+
+- 从已批准的 `docs/<change-slug>/intent.md` 和 `docs/<change-slug>/spec.md` 识别目录，只创建或更新该目录的 `plan.md`。
+- 同一目标、同一交付周期内的方案修改继续更新原目录；已交付后的新目标或独立 bugfix 使用新的 change slug。
+- 禁止创建根目录 `plan.md` 或 `plans/`；禁止覆盖其他变更的 plan。
+
 ## 适用场景
 
 - 实现新功能/写代码/改代码/修 bug/重构
@@ -31,12 +46,12 @@ description: >-
 - 用 `read`/`grep`/`ls` 读代码，**禁止 edit/write**（除非用户明确先要你直接改）
 - 理解现状：相关文件、调用链、测试、约定
 
-### Step 2 — 产出 `plan.md` 并获批
+### Step 2 — 产出 `docs/<change-slug>/plan.md` 并获批
 
 写出实现计划，包含：
 
 ```
-# Plan: <标题>（from spec.md/intent.md <日期>）
+# Plan: <标题>（from docs/<change-slug>/spec.md <日期>）
 
 ## Files that change
 <改动文件列表（新增/修改）>
@@ -53,12 +68,12 @@ description: >-
 
 - 问自己并写进 plan：这个改动可能破坏什么？哪步最危险？为什么不做别的方案？
 - **把 plan 给用户确认**。plan 要详尽到"没看过对话的人也能照着实现"
-- 批准后提交 `plan.md` 进 git（审计链）
+- 批准后提交 `docs/<change-slug>/plan.md` 进 git（审计链）
 
 ### Step 3 — 实现
 
 - 按 plan 实现。计划好时通常一遍过
-- **偏离 plan 时：同一 commit 里更新 `plan.md`**（保持同步）
+- **偏离 plan 时：同一 commit 里更新对应的 `docs/<change-slug>/plan.md`**（保持同步）
 - 涉及多文件独立任务时：可用 pi-subagents 的 `spawn_agent` 并行（各用 git worktree 隔离），你负责编排和 review
 
 ### Step 4 — 自验证（衔接 sdlc-test）
@@ -79,6 +94,6 @@ description: >-
 
 ## 产物与审计
 
-- `plan.md` 与代码同 commit 或先行提交；实现偏离时同步更新
+- `docs/<change-slug>/plan.md` 与代码同 commit 或先行提交；实现偏离时同步更新
 - 改动 diff + 测试随 PR（review 见 sdlc-review）
 - 提交链 = 审计链（谁批准 plan、agent 产出什么）

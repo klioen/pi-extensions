@@ -12,6 +12,21 @@ description: >-
 
 循环闭合：触发器无人在调用路径上也能唤起 agent，发现的问题以 `intent.md` 重新进入流水线。
 
+## 产物路径（强制）
+
+每个需要进入开发流程的 finding 使用独立变更目录：
+
+```text
+docs/<change-slug>/
+├── intent.md
+├── spec.md
+└── plan.md
+```
+
+- bugfix 推荐 `fix-<component>-<problem>`，生产事故推荐 `incident-<component>-<problem>`。
+- 同一事故或修复交付周期内更新原目录；事故关闭后出现的新问题创建新目录。
+- 禁止把 finding 写到根目录或 `plans/`、`intent/` 等分散目录。
+
 ## 适用场景
 
 - 线上事故 / bug / 告警 / 指标越界 / CI 失败
@@ -43,16 +58,16 @@ tiers:
 - **2σ**：agent 只读诊断
 - **3σ**：agent 可行动——但只能开 PR 进 review 门，或触发**预先批准的 runbook**（如回滚）
 
-### Step 3 — 诊断写回 `intent.md`
+### Step 3 — 诊断写回 `docs/<change-slug>/intent.md`
 
-agent 把诊断写成 `intent.md`（sdlc-plan 的格式）：
+agent 先选择独立的 fix/incident change slug，再把诊断写入 `docs/<change-slug>/intent.md`（sdlc-plan 的格式）：
 
 - 异常与证据
 - 建议结果
 - 受影响系统
 - 开放问题
 
-从那里，finding 像任何改动一样走完整流水线（plan → build → test → review）。
+从那里，finding 像任何改动一样在同一目录补齐 `spec.md` 和 `plan.md`，再走完整流水线（plan → build → test → review）。
 
 ### Step 4 — 事故 → eval 回归
 
@@ -72,12 +87,12 @@ agent 把诊断写成 `intent.md`（sdlc-plan 的格式）：
 
 ## 产物与审计
 
-- 事故记录（intent.md + 修复 PR + eval）都版本化
+- 事故记录（`docs/<change-slug>/intent.md` + 修复 PR + eval）都版本化
 - 检测脚本日志有 breach 时间戳与 tier
 - 渠道对话（Slack 等）即审计链：请求、诊断、授权、修复都留在事发处
 
 ## 衡量
 
-- breach 到 intent.md 入 triage 队列的时间
+- breach 到 `docs/<change-slug>/intent.md` 入 triage 队列的时间
 - finding 变成 merged fix 的占比
 - 同类事故复发率（应随 eval 累积下降）

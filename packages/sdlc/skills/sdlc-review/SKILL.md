@@ -11,6 +11,21 @@ description: >-
 
 审查双向进行：既审 incoming PR，也回应自己 PR 上的评论。工程师的注意力上移到"意图与风险"。
 
+## 产物路径（强制）
+
+审查基线必须来自同一变更目录：
+
+```text
+docs/<change-slug>/
+├── intent.md
+├── spec.md
+└── plan.md
+```
+
+- 从 PR 描述、diff 或用户输入识别对应 change slug，并读取该目录的三件套。
+- 同一交付周期内的方案修改应反映在原目录；已交付后的新目标或独立 bugfix 必须使用新目录。
+- 若新变更把 SDLC 产物放在根目录、`plans/`、`intent/` 或拆散到不同目录，作为 compliance finding 报告。
+
 ## 适用场景
 
 - 审查 PR / diff / 代码
@@ -26,11 +41,11 @@ description: >-
 ```
 - Bugs:      逻辑错误、边界 case、隐性回归
 - Security:  注入风险、认证缺口、PII 进日志
-- Compliance: 改动是否匹配 spec.md / plan.md / 设计原则
+- Compliance: 改动是否匹配 docs/<change-slug>/spec.md / plan.md / 设计原则
 ```
 
 - 有 `REVIEW.md` 就按它的 passes 和阈值执行；没有则用上面三遍
-- 阅读上下文：`AGENTS.md`（约定）、`spec.md`/`plan.md`（如果存在）、diff
+- 阅读上下文：`AGENTS.md`（约定）、`docs/<change-slug>/{intent.md,spec.md,plan.md}`、diff
 
 ### Step 2 — 分级：Important vs Nit
 
@@ -48,7 +63,7 @@ description: >-
 ### Security
 - ...
 ### Compliance
-- 与 spec.md/plan.md 一致 / 偏离点：...
+- 与 docs/<change-slug>/spec.md 和 plan.md 一致 / 偏离点：...
 Nits: <count>（列出前 5）
 ```
 
