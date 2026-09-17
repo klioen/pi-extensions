@@ -164,7 +164,9 @@ test("assistant citation stripping preserves non-text content and records exact-
 	} finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("phase2 uses the full Codex consolidation prompt as medium-reasoning user input", () => {
+test("phase2 uses the full Codex consolidation prompt with configured reasoning", () => {
+	const previous = process.env.PI_MEMORY_PHASE2_THINKING;
+	delete process.env.PI_MEMORY_PHASE2_THINKING;
 	const prompt = phase2Prompt("/tmp/memories");
 	assert.match(PHASE2_CONSOLIDATION_PROMPT, /^## Memory Writing Agent: Phase 2 \(Consolidation\)/);
 	assert.match(prompt, /Under `\/tmp\/memories\/`/);
@@ -179,6 +181,12 @@ test("phase2 uses the full Codex consolidation prompt as medium-reasoning user i
 	assert.equal(args[args.indexOf("--extension") + 1], providerExtension);
 	assert.deepEqual(args.slice(-3, -1), ["--model", "traex/gpt-5.6-sol"]);
 	assert.equal(args.at(-1), prompt);
+	process.env.PI_MEMORY_PHASE2_THINKING = "high";
+	assert.equal(phase2PiArgs("traex/gpt-5.6-sol", prompt)[phase2PiArgs("traex/gpt-5.6-sol", prompt).indexOf("--thinking") + 1], "high");
+	process.env.PI_MEMORY_PHASE2_THINKING = "unsafe";
+	assert.equal(phase2PiArgs("traex/gpt-5.6-sol", prompt)[phase2PiArgs("traex/gpt-5.6-sol", prompt).indexOf("--thinking") + 1], "medium");
+	if (previous === undefined) delete process.env.PI_MEMORY_PHASE2_THINKING;
+	else process.env.PI_MEMORY_PHASE2_THINKING = previous;
 });
 
 // --- repairJsonText：修复模型输出里的损坏 JSON ---

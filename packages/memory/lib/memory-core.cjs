@@ -125,9 +125,9 @@ function truncateTextToTokenBudget(text, maxTokens) {
 
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
-function phase1ThinkingLevel() {
-	const configured = process.env.PI_MEMORY_EXTRACT_THINKING;
-	return configured && THINKING_LEVELS.has(configured) ? configured : "low";
+function configuredThinkingLevel(name, fallback) {
+	const configured = process.env[name];
+	return configured && THINKING_LEVELS.has(configured) ? configured : fallback;
 }
 
 function phase1PiArgs(modelSpec, systemPrompt = PHASE1_SYSTEM_PROMPT) {
@@ -142,7 +142,7 @@ function phase1PiArgs(modelSpec, systemPrompt = PHASE1_SYSTEM_PROMPT) {
 		"--system-prompt",
 		systemPrompt,
 		"--thinking",
-		phase1ThinkingLevel(),
+		configuredThinkingLevel("PI_MEMORY_EXTRACT_THINKING", "low"),
 	];
 	if (modelSpec) args.push("--model", modelSpec);
 	return args;
@@ -284,7 +284,7 @@ function phase2PiArgs(modelSpec, prompt, providerExtension) {
 		"--tools",
 		"read,grep,bash,edit,write",
 		"--thinking",
-		"medium",
+		configuredThinkingLevel("PI_MEMORY_PHASE2_THINKING", "medium"),
 	];
 	if (providerExtension) args.push("--extension", providerExtension);
 	if (modelSpec) args.push("--model", modelSpec);
