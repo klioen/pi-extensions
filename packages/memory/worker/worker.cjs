@@ -448,7 +448,9 @@ function resetGitRepository() {
 	git(["config", "user.name", "pi-memory"]);
 	git(["config", "user.email", "pi-memory@localhost"]);
 	git(["add", "-A"]);
-	git(["commit", "--allow-empty", "-qm", "memory baseline"]);
+	// This is a disposable implementation baseline, not a user source commit.
+	// Skip global/project hooks so interactive hooks cannot take over Pi's TTY.
+	git(["commit", "--allow-empty", "--no-verify", "-qm", "memory baseline"]);
 }
 
 function prepareMemoryWorkspace() {
