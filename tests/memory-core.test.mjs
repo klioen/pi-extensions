@@ -64,16 +64,31 @@ test("rollout token budget uses 70 percent of context window with 150k fallback"
 	assert.equal(resolveRolloutTokenBudget(0), DEFAULT_ROLLOUT_TOKEN_LIMIT);
 });
 
-test("phase1 pi runtime uses the dedicated Codex system prompt and low reasoning", () => {
-	const args = phase1PiArgs("traex/gpt-5.6-sol");
-	for (const flag of ["--print", "--no-session", "--no-tools", "--no-skills", "--no-context-files"]) assert.ok(args.includes(flag));
-	assert.equal(args.includes("--no-extensions"), false);
-	assert.equal(args[args.indexOf("--system-prompt") + 1], PHASE1_SYSTEM_PROMPT);
-	assert.equal(args[args.indexOf("--thinking") + 1], "low");
-	assert.deepEqual(args.slice(-2), ["--model", "traex/gpt-5.6-sol"]);
-	assert.match(PHASE1_SYSTEM_PROMPT, /^## Memory Writing Agent: Phase 1 \(Single Rollout\)/);
-	assert.match(PHASE1_SYSTEM_PROMPT, /NO-OP \/ MINIMUM SIGNAL GATE/);
-	assert.match(PHASE1_SYSTEM_PROMPT, /`raw_memory` FORMAT \(STRICT\)/);
+test("phase1 pi runtime uses the dedicated Codex system prompt and configured reasoning", () => {
+	const previous = process.env.PI_MEMORY_EXTRACT_THINKING;
+	try {
+		delete process.env.PI_MEMORY_EXTRACT_THINKING;
+		let args = phase1PiArgs("traex/gpt-5.6-sol");
+		for (const flag of ["--print", "--no-session", "--no-tools", "--no-skills", "--no-context-files"]) assert.ok(args.includes(flag));
+		assert.equal(args.includes("--no-extensions"), false);
+		assert.equal(args[args.indexOf("--system-prompt") + 1], PHASE1_SYSTEM_PROMPT);
+		assert.equal(args[args.indexOf("--thinking") + 1], "low");
+		assert.deepEqual(args.slice(-2), ["--model", "traex/gpt-5.6-sol"]);
+
+		process.env.PI_MEMORY_EXTRACT_THINKING = "high";
+		args = phase1PiArgs("traex/gpt-5.6-sol");
+		assert.equal(args[args.indexOf("--thinking") + 1], "high");
+
+		process.env.PI_MEMORY_EXTRACT_THINKING = "unsafe";
+		args = phase1PiArgs("traex/gpt-5.6-sol");
+		assert.equal(args[args.indexOf("--thinking") + 1], "low");
+		assert.match(PHASE1_SYSTEM_PROMPT, /^## Memory Writing Agent: Phase 1 \(Single Rollout\)/);
+		assert.match(PHASE1_SYSTEM_PROMPT, /NO-OP \/ MINIMUM SIGNAL GATE/);
+		assert.match(PHASE1_SYSTEM_PROMPT, /`raw_memory` FORMAT \(STRICT\)/);
+	} finally {
+		if (previous === undefined) delete process.env.PI_MEMORY_EXTRACT_THINKING;
+		else process.env.PI_MEMORY_EXTRACT_THINKING = previous;
+	}
 });
 
 test("token-aware truncation preserves head and tail", () => {

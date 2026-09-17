@@ -123,6 +123,13 @@ function truncateTextToTokenBudget(text, maxTokens) {
 	return `${value.slice(0, headChars)}${marker}${value.slice(-tailChars)}`;
 }
 
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+function phase1ThinkingLevel() {
+	const configured = process.env.PI_MEMORY_EXTRACT_THINKING;
+	return configured && THINKING_LEVELS.has(configured) ? configured : "low";
+}
+
 function phase1PiArgs(modelSpec, systemPrompt = PHASE1_SYSTEM_PROMPT) {
 	const args = [
 		"--print",
@@ -135,7 +142,7 @@ function phase1PiArgs(modelSpec, systemPrompt = PHASE1_SYSTEM_PROMPT) {
 		"--system-prompt",
 		systemPrompt,
 		"--thinking",
-		"low",
+		phase1ThinkingLevel(),
 	];
 	if (modelSpec) args.push("--model", modelSpec);
 	return args;
