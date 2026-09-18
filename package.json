@@ -1,41 +1,7 @@
 {
 	"name": "pi-extensions",
 	"version": "0.1.0",
-	"description": "Custom pi coding agent packages, including web access, subagents, planning, memory, goals, and the Pi Web Control Deck.",
-	"type": "module",
-	"keywords": [
-		"pi-package"
-	],
-	"pi": {
-		"extensions": [
-			"./packages/env/extensions",
-			"./packages/web-access/extensions",
-			"./packages/subagents/extensions",
-			"./packages/todo/extensions",
-			"./packages/plan/extensions",
-			"./packages/lark/extensions",
-			"./packages/failover/extensions",
-			"./packages/memory/extensions",
-			"./packages/goal/extensions",
-			"./packages/pi-web/extensions"
-		]
-	},
-	"peerDependencies": {
-		"@earendil-works/pi-agent-core": "*",
-		"@earendil-works/pi-coding-agent": "*",
-		"@earendil-works/pi-ai": "*",
-		"typebox": "*"
-	},
-	"workspaces": [
-		"packages/*"
-	],
-	"scripts": {
-		"test": "node --disable-warning=ExperimentalWarning --test \"tests/*.test.mjs\" && npm run pi-web:test && npm run pi-web:verify-public",
-		"pi-web:dev": "npm run dev --workspace pi-web",
-		"pi-web:build": "npm run build --workspace pi-web",
-		"pi-web:typecheck": "npm run typecheck --workspace pi-web",
-		"pi-web:test": "npm run test --workspace pi-web",
-		"pi-web:verify-public": "npm run verify:public --workspace pi-web",
-		"evals:list": "ls evals 2>/dev/null || echo '(no evals yet)'"
-	}
+	"description": "ARCHIVED — Original umbrella repo for pi coding agent packages. Each package has been split into its own repository.",
+	"private": true,
+	"keywords": ["pi-package", "archived"]
 }
